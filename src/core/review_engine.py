@@ -86,6 +86,39 @@ SYSTEM_PROMPT = """你是一位资深代码审查专家，负责对代码变更�
 - C: 需改进，存在较多问题或少量严重问题
 - D: 需重写，存在严重设计/安全问题"""
 
+FORMAT_RETRY_PROMPT = """你上一次的输出格式不符合要求，无法被系统正确解析。
+
+错误类型: {error_type}
+错误详情: {error_detail}
+
+请严格按照以下 JSON 格式重新输出你的审查结果（不要包含 markdown 代码块标记，不要在 JSON 前后添加任何其他文字）：
+{{
+  "overall_assessment": "对本次代码变更的整体评价",
+  "score": "A/B/C/D",
+  "issues": [
+    {{
+      "file_path": "文件路径",
+      "line_start": 行号或null,
+      "line_end": 行号或null,
+      "severity": "critical/major/minor/info",
+      "category": "bug/security/performance/maintainability/style/design",
+      "content": "问题描述",
+      "suggestion": "修改建议"
+    }}
+  ],
+  "highlights": ["代码亮点1", "代码亮点2"]
+}}
+
+请直接输出纯 JSON，不要包含任何解释文字。"""
+
+_ERROR_TYPE_DESCRIPTIONS = {
+    "no_json": "你的回复中没有找到 JSON 对象，请确保输出一个完整的 JSON。",
+    "json_syntax_error": "找到了 JSON 结构但语法有误: {detail}。请检查括号匹配、逗号和引号。",
+    "missing_fields": "JSON 解析成功但缺少必需字段: {detail}。",
+}
+
+_RETRY_TEMPERATURES = [0.1, 0.05, 0.0]
+
 
 @dataclass
 class ReviewResult:
@@ -160,7 +193,7 @@ class ReviewEngine:
             if not response.tool_calls:
                 # No tool calls — LLM has finished analysis
                 content = response.content or ""
-                result = self._parse_result(content)
+                result = await self._parse_with_retry(content, messages, tag)
                 result.tool_calls_count = total_tool_calls
                 logger.info(
                     "%s结果解析成功: 评级=%s 问题数=%d",
@@ -212,20 +245,45 @@ class ReviewEngine:
             })
         response = await self.llm.chat(messages, tools=None)
         content = response.content or ""
-        result = self._parse_result(content)
+        result = await self._parse_with_retry(content, messages, tag)
         result.tool_calls_count = total_tool_calls
         return result
 
     @staticmethod
-    def _parse_result(content: str) -> ReviewResult:
-        """Parse the LLM output into a ReviewResult."""
-        # Try to extract JSON from the response
-        # Remove markdown code block markers if present
+    def _try_parse(content: str) -> tuple[ReviewResult | None, str, str]:
+        """尝试解析 LLM 输出，返回 (result_or_None, error_type, error_detail)"""
         cleaned = re.sub(r"```json\s*", "", content)
         cleaned = re.sub(r"```\s*$", "", cleaned)
         cleaned = cleaned.strip()
 
-        # Try to find JSON object in the text
+        json_match = re.search(r"\{[\s\S]*\}", cleaned)
+        if not json_match:
+            return None, "no_json", "回复中未找到 JSON 对象"
+
+        try:
+            data = json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            return None, "json_syntax_error", str(e)
+
+        required = {"overall_assessment", "score"}
+        missing = required - set(data.keys())
+        if missing:
+            return None, "missing_fields", ", ".join(sorted(missing))
+
+        return ReviewResult(
+            overall_assessment=data.get("overall_assessment", ""),
+            score=data.get("score", "B"),
+            issues=data.get("issues", []),
+            highlights=data.get("highlights", []),
+        ), "", ""
+
+    @staticmethod
+    def _fallback_result(content: str) -> ReviewResult:
+        """降级解析：尽力提取部分字段，否则使用原始文本。"""
+        cleaned = re.sub(r"```json\s*", "", content)
+        cleaned = re.sub(r"```\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+
         json_match = re.search(r"\{[\s\S]*\}", cleaned)
         if json_match:
             try:
@@ -239,9 +297,75 @@ class ReviewEngine:
             except json.JSONDecodeError:
                 pass
 
-        # Fallback: treat the whole response as the assessment
-        logger.warning("无法从 LLM 响应中解析 JSON，使用原始文本作为评价")
-        return ReviewResult(overall_assessment=content, score="B")
+        # 清理残余 JSON 碎片
+        text = re.sub(r"\{[\s\S]*", "", content).strip() or content.strip()
+        assessment = (
+            "> **注意**: 审查结果格式解析失败，以下为 AI 原始审查意见：\n\n"
+            + text
+        )
+        return ReviewResult(overall_assessment=assessment, score="B")
+
+    async def _parse_with_retry(
+        self,
+        content: str,
+        messages: list[dict],
+        tag: str = "",
+    ) -> ReviewResult:
+        """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。"""
+        result, error_type, error_detail = self._try_parse(content)
+        if result is not None:
+            return result
+
+        max_retries = settings.AGENT_FORMAT_RETRY_MAX
+        retry_messages = list(messages)  # 浅拷贝
+        last_content = content
+
+        for attempt in range(1, max_retries + 1):
+            desc = _ERROR_TYPE_DESCRIPTIONS.get(error_type, error_detail)
+            if "{detail}" in desc:
+                desc = desc.format(detail=error_detail)
+
+            logger.warning(
+                "%s输出格式解析失败 (类型=%s)，开始第 %d/%d 次格式重试",
+                tag, error_type, attempt, max_retries,
+            )
+
+            retry_messages.append({"role": "assistant", "content": last_content})
+            retry_messages.append({
+                "role": "user",
+                "content": FORMAT_RETRY_PROMPT.format(
+                    error_type=desc,
+                    error_detail=error_detail,
+                ),
+            })
+
+            temperature = _RETRY_TEMPERATURES[min(attempt - 1, len(_RETRY_TEMPERATURES) - 1)]
+            try:
+                response = await self.llm.chat(
+                    retry_messages, tools=None, temperature=temperature,
+                )
+                last_content = response.content or ""
+            except Exception:
+                logger.error(
+                    "%s格式重试第 %d 次 LLM 调用异常", tag, attempt, exc_info=True,
+                )
+                continue
+
+            result, error_type, error_detail = self._try_parse(last_content)
+            if result is not None:
+                logger.info("%s格式重试成功 (第 %d 次尝试)", tag, attempt)
+                return result
+
+        logger.error("%s格式重试全部失败 (%d 次)，使用降级 fallback", tag, max_retries)
+        return self._fallback_result(last_content)
+
+    @staticmethod
+    def _parse_result(content: str) -> ReviewResult:
+        """Parse the LLM output into a ReviewResult (同步，兼容外部调用)."""
+        result, _, _ = ReviewEngine._try_parse(content)
+        if result is not None:
+            return result
+        return ReviewEngine._fallback_result(content)
 
     @staticmethod
     def format_gitlab_comment(result: ReviewResult, files_count: int) -> str:

@@ -365,21 +365,27 @@ class AgentToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read the content of a file in the repository. Use to understand the full context of code referenced in the diff.",
+                    "description": (
+                        "读取仓库中指定文件的内容。"
+                        "当你需要查看 diff 中引用的代码的完整上下文、理解函数或类的完整实现、"
+                        "检查导入关系或配置内容时，请使用此工具。"
+                        "支持通过行号范围读取文件的指定片段，避免一次性加载过大的文件。"
+                        "返回结果带有行号标注，方便你在审查评论中精确引用代码位置。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Relative file path from repo root",
+                                "description": "相对于仓库根目录的文件路径，例如 'src/main.py' 或 'config/settings.yaml'",
                             },
                             "start_line": {
                                 "type": "integer",
-                                "description": "Start line number (1-based, optional)",
+                                "description": "起始行号（从 1 开始计数）。如果只想读取文件的某一部分，请指定此参数。省略则从文件开头读取",
                             },
                             "end_line": {
                                 "type": "integer",
-                                "description": "End line number (inclusive, optional)",
+                                "description": "结束行号（包含该行）。与 start_line 配合使用来读取指定范围。省略则读取到文件末尾",
                             },
                         },
                         "required": ["path"],
@@ -390,21 +396,28 @@ class AgentToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "search_code",
-                    "description": "Search for a text pattern in the codebase using grep. Useful for finding usages, references, or related code.",
+                    "description": (
+                        "在整个代码仓库中搜索匹配指定模式的文本（基于 grep，支持正则表达式）。"
+                        "适用场景：查找某个函数/变量/类在其他文件中的调用和引用；"
+                        "追踪某个配置项或字符串常量的使用位置；"
+                        "查找与当前审查代码相关的上下游依赖。"
+                        "搜索会自动排除 .git、node_modules、__pycache__ 等非代码目录。"
+                        "返回结果包含文件路径、行号和匹配行的内容。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "pattern": {
                                 "type": "string",
-                                "description": "Search pattern (regex supported)",
+                                "description": "搜索模式，支持正则表达式。例如：'def process_' 搜索所有以 process_ 开头的函数定义，'TODO|FIXME' 搜索待办标记",
                             },
                             "file_pattern": {
                                 "type": "string",
-                                "description": "File glob filter, e.g. '*.py' (optional)",
+                                "description": "文件名通配符过滤器，用于限定搜索范围。例如 '*.py' 只搜索 Python 文件，'*.ts' 只搜索 TypeScript 文件。省略则搜索所有文件",
                             },
                             "max_results": {
                                 "type": "integer",
-                                "description": "Max results to return (default 30, max 30)",
+                                "description": "返回的最大结果数量，默认 30，上限 30。如果搜索结果过多，建议缩小搜索范围或使用更精确的模式",
                             },
                         },
                         "required": ["pattern"],
@@ -415,21 +428,27 @@ class AgentToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "list_directory",
-                    "description": "List contents of a directory. Use to understand project structure.",
+                    "description": (
+                        "列出仓库中指定目录的内容，了解项目的文件结构和组织方式。"
+                        "适用场景：初始了解项目的整体目录结构；"
+                        "查看某个模块/包下有哪些文件；确认某个文件或目录是否存在。"
+                        "目录名后会带 '/' 后缀以便区分文件和目录。"
+                        "自动排除 .git、node_modules、__pycache__ 等无关目录。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Relative directory path (default: repo root)",
+                                "description": "相对于仓库根目录的目录路径。默认为 '.'（仓库根目录）。例如 'src/core' 或 'tests'",
                             },
                             "recursive": {
                                 "type": "boolean",
-                                "description": "List recursively (default: false)",
+                                "description": "是否递归列出子目录内容。设为 true 可一次性查看目录树结构，默认 false 仅列出当前层级",
                             },
                             "max_depth": {
                                 "type": "integer",
-                                "description": "Max recursion depth (default 3, max 3)",
+                                "description": "递归列出时的最大深度，默认 3，上限 3。仅在 recursive 为 true 时生效",
                             },
                         },
                     },
@@ -439,17 +458,24 @@ class AgentToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "find_definition",
-                    "description": "Find where a symbol (function, class, type) is defined. Supports Python, JS/TS, Java, Go, Rust, C/C++, Ruby, PHP.",
+                    "description": (
+                        "查找指定符号（函数、类、类型、接口、常量等）在代码中的定义位置。"
+                        "使用语言感知的正则模式进行匹配，支持 Python、JavaScript/TypeScript、"
+                        "Java、Kotlin、C#、Go、Rust、C/C++、Ruby、PHP 等语言。"
+                        "适用场景：查看 diff 中调用的函数的原始定义；理解某个类或接口的结构；"
+                        "确认某个类型或常量的声明方式。"
+                        "返回结果包含定义所在的文件路径、行号，以及定义处前后各 3 行的上下文代码。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "symbol": {
                                 "type": "string",
-                                "description": "The symbol name to find",
+                                "description": "要查找的符号名称，例如函数名 'process_webhook'、类名 'ReviewEngine'、类型名 'ToolResult'",
                             },
                             "file_pattern": {
                                 "type": "string",
-                                "description": "File glob filter, e.g. '*.py' (optional)",
+                                "description": "文件名通配符过滤器，用于缩小搜索范围。例如 '*.py' 只在 Python 文件中查找。省略则搜索所有支持的代码文件",
                             },
                         },
                         "required": ["symbol"],
@@ -460,14 +486,19 @@ class AgentToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "get_file_info",
-                    "description": "Get metadata (size, line count, language, binary status) for one or more files.",
+                    "description": (
+                        "获取一个或多个文件的元数据信息，包括文件大小、代码行数、编程语言和是否为二进制文件。"
+                        "适用场景：在读取文件前先了解文件大小以决定是否需要分段读取；"
+                        "快速判断文件类型和规模；批量检查多个文件的基本信息。"
+                        "单次调用最多支持 20 个文件路径。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "paths": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "List of relative file paths",
+                                "description": "相对于仓库根目录的文件路径列表，例如 ['src/main.py', 'README.md', 'package.json']",
                             },
                         },
                         "required": ["paths"],

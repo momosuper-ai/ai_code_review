@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # Agent
     AGENT_MAX_TOOL_ROUNDS: int = 10
+    AGENT_FORMAT_RETRY_MAX: int = 3
 
     # Main branches to trigger review
     MAIN_BRANCHES: str = "main,master"
