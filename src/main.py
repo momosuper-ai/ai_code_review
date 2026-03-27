@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 
 from src.api.router import api_router
-from src.models import Base, engine
+from src.models import Base, engine, ensure_database_exists
 from src.models.review import Review, ReviewComment  # noqa: F401
 from src.utils.logger import logger
 
@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     logger.info("AI 代码审查服务启动中...")
     for attempt in range(1, _DB_RETRY_MAX + 1):
         try:
+            await asyncio.to_thread(ensure_database_exists)
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             logger.info("数据库表初始化完成")

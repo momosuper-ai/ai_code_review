@@ -110,13 +110,17 @@ def run_review(
 
     except Exception as exc:
         # 4. 同步标记失败
-        with SyncSession() as session:
-            review_obj = session.get(Review, review_id)
-            if review_obj:
-                review_obj.status = ReviewStatus.failed
-                review_obj.error_message = str(exc)[:2000]
-                review_obj.completed_at = datetime.utcnow()
-                session.commit()
+        try:
+            with SyncSession() as session:
+                review_obj = session.get(Review, review_id)
+                if review_obj:
+                    review_obj.status = ReviewStatus.failed
+                    review_obj.error_message = str(exc)[:2000]
+                    review_obj.completed_at = datetime.utcnow()
+                    session.commit()
+        except Exception:
+            logger.error("[review:%d] 标记失败状态时数据库写入也失败", review_id)
+
         logger.error(
             "审查任务失败: 项目=%s 提交=%s 重试次数=%d/%d 错误=%s",
             project_name, commit_sha[:8], self.request.retries, self.max_retries, exc,

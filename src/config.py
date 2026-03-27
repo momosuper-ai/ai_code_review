@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/obc_review"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres@postgres:5432/obc_review"
 
     # Redis
     REDIS_URL: str = "redis://redis:6379/0"
@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     # Main branches to trigger review
     MAIN_BRANCHES: str = "main,master"
 
+    # API Key 认证（逗号分隔，空值 = 开发模式免认证）
+    API_KEYS: str = ""
+
+    # 速率限制
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_WEBHOOK: str = "30/minute"
+    RATE_LIMIT_REVIEWS: str = "60/minute"
+    RATE_LIMIT_DEFAULT: str = "120/minute"
+
     @property
     def DATABASE_URL_SYNC(self) -> str:
         """同步数据库连接 URL，供 Celery 任务使用。"""
@@ -44,6 +53,10 @@ class Settings(BaseSettings):
     @property
     def main_branch_list(self) -> list[str]:
         return [b.strip() for b in self.MAIN_BRANCHES.split(",") if b.strip()]
+
+    @property
+    def api_key_list(self) -> list[str]:
+        return [k.strip() for k in self.API_KEYS.split(",") if k.strip()]
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

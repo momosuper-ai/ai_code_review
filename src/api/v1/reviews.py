@@ -5,8 +5,15 @@ from sqlalchemy.orm import selectinload
 
 from src.models import get_session
 from src.models.review import Review, ReviewComment
+from src.utils.rate_limit import rate_limit_dependency
+from src.utils.security import require_api_key
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[
+        Depends(require_api_key),
+        Depends(rate_limit_dependency("60/minute")),
+    ]
+)
 
 
 @router.get("")

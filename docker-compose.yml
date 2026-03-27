@@ -15,6 +15,7 @@ services:
       - ./src:/app/src
       - repos_data:/data/repos
       - logs_data:/data/logs
+    restart: unless-stopped
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
     logging:
       driver: "json-file"
@@ -36,6 +37,7 @@ services:
       - ./src:/app/src
       - repos_data:/data/repos
       - logs_data:/data/logs
+    restart: unless-stopped
     command: celery -A src.tasks.celery_app worker --loglevel=info --concurrency=2 -Q review,celery
     logging:
       driver: "json-file"
@@ -45,19 +47,22 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    container_name: obc-review-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: obc_review
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d obc_review"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 15s
 
   redis:
     image: redis:7-alpine
@@ -66,6 +71,7 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "redis_secret_2024", "ping"]
       interval: 5s
@@ -92,6 +98,7 @@ services:
 
   sonar-db:
     image: postgres:16-alpine
+    container_name: obc-sonar-postgres
     environment:
       POSTGRES_USER: sonarqube
       POSTGRES_PASSWORD: sonarqube

@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from src.config import settings
 from src.utils.logger import logger
+from src.utils.rate_limit import rate_limit_dependency
 from src.utils.security import verify_gitlab_token
 
 router = APIRouter()
@@ -10,7 +11,7 @@ router = APIRouter()
 _NULL_SHA = "0" * 40
 
 
-@router.post("/gitlab")
+@router.post("/gitlab", dependencies=[Depends(rate_limit_dependency("30/minute"))])
 async def gitlab_webhook(
     request: Request,
     x_gitlab_token: str | None = Header(None),
