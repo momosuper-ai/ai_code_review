@@ -52,3 +52,13 @@ class LLMClient:
         except Exception as exc:
             logger.error("LLM API 调用失败: 模型=%s 错误类型=%s 错误=%s", self._model, type(exc).__name__, exc)
             raise
+
+    async def aclose(self):
+        """关闭底层 HTTP 客户端连接。"""
+        await self._client.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()

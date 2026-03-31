@@ -136,6 +136,16 @@ class ReviewEngine:
         self.tools = AgentToolExecutor(repo_path)
         self.max_rounds = settings.AGENT_MAX_TOOL_ROUNDS
 
+    async def aclose(self):
+        """关闭底层 LLM 客户端。"""
+        await self.llm.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()
+
     @staticmethod
     def filter_diffs(changes: list[dict]) -> list[dict]:
         """Filter out non-code files from the diff list."""

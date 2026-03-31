@@ -2,6 +2,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# 配置 pip 镜像源
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
+    && pip config set global.trusted-host mirrors.aliyun.com
+
+# 切换 apt 为阿里云镜像源（兼容新旧两种 sources 文件格式）
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|https\?://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's|https\?://security.debian.org|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|https\?://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list; \
+        sed -i 's|https\?://security.debian.org|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; \
+    fi
+
 # 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \

@@ -162,34 +162,37 @@ async def _do_review_async(
 
     # 3. Run review engine
     engine = ReviewEngine(repo_dir)
-    filtered = engine.filter_diffs(changes)
-    files_count = len(filtered)
-    logger.info(
-        "[review:%d] Diff 过滤: %d -> %d 个文件 (跳过 %d 个)",
-        review_id, len(changes), files_count, len(changes) - files_count,
-    )
+    try:
+        filtered = engine.filter_diffs(changes)
+        files_count = len(filtered)
+        logger.info(
+            "[review:%d] Diff 过滤: %d -> %d 个文件 (跳过 %d 个)",
+            review_id, len(changes), files_count, len(changes) - files_count,
+        )
 
-    t0 = time.time()
-    review_result = await engine.run_review(filtered, review_id=review_id)
-    logger.info(
-        "[review:%d] 审查完成: 评级=%s 问题数=%d 工具调用=%d (%.1f秒)",
-        review_id, review_result.score, len(review_result.issues),
-        review_result.tool_calls_count, time.time() - t0,
-    )
+        t0 = time.time()
+        review_result = await engine.run_review(filtered, review_id=review_id)
+        logger.info(
+            "[review:%d] 审查完成: 评级=%s 问题数=%d 工具调用=%d (%.1f秒)",
+            review_id, review_result.score, len(review_result.issues),
+            review_result.tool_calls_count, time.time() - t0,
+        )
 
-    # 4. Format and post comment
-    comment_body = ReviewEngine.format_gitlab_comment(review_result, files_count)
+        # 4. Format and post comment
+        comment_body = ReviewEngine.format_gitlab_comment(review_result, files_count)
 
-    t0 = time.time()
-    if trigger_type == "merge_request" and mr_iid:
-        await gitlab.post_mr_note(project_id, mr_iid, comment_body)
-        logger.info("[review:%d] 评论已发布到 GitLab MR#%s (%.1f秒)", review_id, mr_iid, time.time() - t0)
-    else:
-        await gitlab.post_commit_comment(project_id, commit_sha, comment_body)
-        logger.info("[review:%d] 评论已发布到 GitLab 提交 %s (%.1f秒)", review_id, commit_sha[:8], time.time() - t0)
+        t0 = time.time()
+        if trigger_type == "merge_request" and mr_iid:
+            await gitlab.post_mr_note(project_id, mr_iid, comment_body)
+            logger.info("[review:%d] 评论已发布到 GitLab MR#%s (%.1f秒)", review_id, mr_iid, time.time() - t0)
+        else:
+            await gitlab.post_commit_comment(project_id, commit_sha, comment_body)
+            logger.info("[review:%d] 评论已发布到 GitLab 提交 %s (%.1f秒)", review_id, commit_sha[:8], time.time() - t0)
 
-    # 5. Update local repo to latest
-    await repo_mgr.update_repo(project_name, branch)
+        # 5. Update local repo to latest
+        await repo_mgr.update_repo(project_name, branch)
+    finally:
+        await engine.aclose()
 
     return {
         "overall_assessment": review_result.overall_assessment,
