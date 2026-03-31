@@ -5,8 +5,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 
 from src.api.router import api_router
+from src.config import settings
 from src.models import Base, engine, ensure_database_exists
 from src.models.review import Review, ReviewComment  # noqa: F401
+from src.utils.ip_whitelist import IPWhitelistMiddleware
 from src.utils.logger import logger
 
 _DB_RETRY_MAX = 5
@@ -54,6 +56,10 @@ async def log_requests(request: Request, call_next):
         duration_ms,
     )
     return response
+
+
+# IP 白名单中间件（后注册 = 先执行，在日志中间件之前拦截非法 IP）
+app.add_middleware(IPWhitelistMiddleware, whitelist_raw=settings.IP_WHITELIST)
 
 
 @app.get("/health")

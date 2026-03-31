@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_REVIEWS: str = "60/minute"
     RATE_LIMIT_DEFAULT: str = "120/minute"
 
+    # IP 白名单（逗号分隔，支持单 IP 和 CIDR，空值 = 开发模式免限制）
+    IP_WHITELIST: str = ""
+
     @property
     def DATABASE_URL_SYNC(self) -> str:
         """同步数据库连接 URL，供 Celery 任务使用。"""
