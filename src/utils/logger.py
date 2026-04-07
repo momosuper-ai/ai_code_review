@@ -39,6 +39,7 @@ def setup_logger(name: str = "obc_review") -> logging.Logger:
         return _logger
 
     _logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+    _logger.propagate = False
 
     # 选择格式化器
     if settings.LOG_FORMAT == "json":
