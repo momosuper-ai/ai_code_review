@@ -509,6 +509,20 @@ class AgentToolExecutor:
 
     def execute_tool(self, name: str, arguments: dict) -> ToolResult:
         """Dispatch a tool call by name."""
+        required_params = {
+            "read_file": ["path"],
+            "search_code": ["pattern"],
+            "find_definition": ["symbol"],
+            "get_file_info": ["paths"],
+        }
+        if name in required_params:
+            missing = [p for p in required_params[name] if p not in arguments]
+            if missing:
+                return ToolResult(
+                    success=False,
+                    output=f"缺少必需参数: {', '.join(missing)}",
+                )
+
         dispatch = {
             "read_file": lambda args: self.read_file(
                 args["path"], args.get("start_line"), args.get("end_line")

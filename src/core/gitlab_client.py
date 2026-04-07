@@ -103,6 +103,7 @@ class GitLabClient:
                 f"/projects/{project_id}/repository/commits/{sha}/comments",
                 json={"note": note},
             )
+            logger.info("审查结果: %s", note)
             duration_ms = (time.time() - t0) * 1000
             logger.info(
                 "GitLab API: POST 提交评论 项目=%d 提交=%s -> 状态码 %d (%.0f毫秒)",

@@ -256,20 +256,30 @@ class DimensionAgent:
                 )
                 return self._to_dimension_result(result, tool_calls_count, start_time)
 
-            # Process tool calls
-            messages.append(response)
+            # Process tool calls — 先解析参数，修复无效 JSON 后再追加到消息历史
+            parsed_args_map: dict[str, dict] = {}
             for tc in response.tool_calls:
                 try:
-                    args = json.loads(tc.function.arguments)
+                    parsed_args_map[tc.id] = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
-                    args = {}
+                    logger.warning(
+                        "%s工具 %s 参数 JSON 解析失败，原始内容: %s",
+                        tag, tc.function.name,
+                        tc.function.arguments[:200] if tc.function.arguments else "(空)",
+                    )
+                    parsed_args_map[tc.id] = {}
+                    tc.function.arguments = "{}"
+
+            messages.append(response)
+            for tc in response.tool_calls:
+                args = parsed_args_map[tc.id]
 
                 t0 = time.time()
                 tool_result = self.tools.execute_tool(tc.function.name, args)
                 tool_ms = (time.time() - t0) * 1000
                 tool_calls_count += 1
 
-                status = "成功" if not tool_result.output.startswith("Error") else "失败"
+                status = "成功" if tool_result.success else "失败"
                 logger.info(
                     "%s工具调用: %s(%s) -> %s (%.0f毫秒)",
                     tag, tc.function.name,
@@ -422,20 +432,30 @@ class ReviewEngine:
                 )
                 return result
 
-            # Process tool calls
-            messages.append(response)
+            # Process tool calls — 先解析参数，修复无效 JSON 后再追加到消息历史
+            parsed_args_map: dict[str, dict] = {}
             for tc in response.tool_calls:
                 try:
-                    args = json.loads(tc.function.arguments)
+                    parsed_args_map[tc.id] = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
-                    args = {}
+                    logger.warning(
+                        "%s工具 %s 参数 JSON 解析失败，原始内容: %s",
+                        tag, tc.function.name,
+                        tc.function.arguments[:200] if tc.function.arguments else "(空)",
+                    )
+                    parsed_args_map[tc.id] = {}
+                    tc.function.arguments = "{}"
+
+            messages.append(response)
+            for tc in response.tool_calls:
+                args = parsed_args_map[tc.id]
 
                 t0 = time.time()
                 tool_result = self.tools.execute_tool(tc.function.name, args)
                 tool_ms = (time.time() - t0) * 1000
                 total_tool_calls += 1
 
-                status = "成功" if not tool_result.output.startswith("Error") else "失败"
+                status = "成功" if tool_result.success else "失败"
                 logger.info(
                     "%s工具调用: %s(%s) -> %s (%.0f毫秒)",
                     tag, tc.function.name,
