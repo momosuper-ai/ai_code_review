@@ -60,7 +60,7 @@ def run_review(
     logger.info("[review:%d] 开始审查: 项目=%s 提交=%s", review_id, project_name, commit_sha[:8])
 
     try:
-        # 2. async 部分：clone repo、获取 diff、LLM 审查、发 GitLab 评论
+        # 2. async 部分：clone repo、获取 diff、LLM 审查（不发评论）
         result = asyncio.run(
             _do_review_async(
                 trigger_type=trigger_type,
@@ -74,32 +74,32 @@ def run_review(
             )
         )
 
-        # 3. 同步写入审查结果
-        t0 = time.time()
-        with SyncSession() as session:
-            review_obj = session.get(Review, review_id)
-            review_obj.status = ReviewStatus.completed
-            review_obj.summary = result["overall_assessment"]
-            review_obj.files_reviewed = result["files_count"]
-            review_obj.issues_found = len(result["issues"])
-            review_obj.completed_at = datetime.utcnow()
+        # 3. 先持久化到 DB
+        _save_review_result(review_id, result)
 
-            for issue in result["issues"]:
-                comment = ReviewComment(
+        # 维度统计日志
+        for stat in result.get("dimension_stats", []):
+            logger.info(
+                "[review:%d] 维度 %s: 评级=%s 问题数=%d 工具调用=%d 耗时=%.1fs %s",
+                review_id, stat["display_name"], stat["score"],
+                stat["issues_count"], stat["tool_calls"], stat["duration"],
+                f"(失败: {stat['error']})" if not stat["success"] else "",
+            )
+
+        # 4. DB 成功后再发评论（失败不触发任务重试）
+        try:
+            asyncio.run(
+                _post_comment_async(
+                    trigger_type=trigger_type,
+                    project_id=project_id,
+                    mr_iid=mr_iid,
+                    commit_sha=commit_sha,
+                    comment_body=result["comment_body"],
                     review_id=review_id,
-                    file_path=issue.get("file_path", ""),
-                    line_start=issue.get("line_start"),
-                    line_end=issue.get("line_end"),
-                    severity=Severity(issue.get("severity", "info")),
-                    category=issue.get("category", ""),
-                    content=issue.get("content", ""),
-                    suggestion=issue.get("suggestion"),
-                    code_snippet=issue.get("code_snippet"),
                 )
-                session.add(comment)
-
-            session.commit()
-        logger.info("[review:%d] 结果已持久化到数据库 (%.1f秒)", review_id, time.time() - t0)
+            )
+        except Exception:
+            logger.error("[review:%d] GitLab 评论发送失败", review_id, exc_info=True)
 
         total_time = time.time() - task_start
         logger.info(
@@ -109,18 +109,7 @@ def run_review(
         )
 
     except Exception as exc:
-        # 4. 同步标记失败
-        try:
-            with SyncSession() as session:
-                review_obj = session.get(Review, review_id)
-                if review_obj:
-                    review_obj.status = ReviewStatus.failed
-                    review_obj.error_message = str(exc)[:2000]
-                    review_obj.completed_at = datetime.utcnow()
-                    session.commit()
-        except Exception:
-            logger.error("[review:%d] 标记失败状态时数据库写入也失败", review_id)
-
+        _mark_review_failed(review_id, exc)
         logger.error(
             "审查任务失败: 项目=%s 提交=%s 重试次数=%d/%d 错误=%s",
             project_name, commit_sha[:8], self.request.retries, self.max_retries, exc,
@@ -138,7 +127,7 @@ async def _do_review_async(
     before_sha: str | None,
     review_id: int,
 ) -> dict:
-    """执行非 DB 的 async 操作：clone repo、获取 diff、LLM 审查、发 GitLab 评论。"""
+    """执行 async 操作：clone repo、获取 diff、LLM 审查。不发送评论。"""
     gitlab = GitLabClient()
     repo_mgr = RepoManager()
 
@@ -157,7 +146,10 @@ async def _do_review_async(
         changes = data.get("diffs", [])
     else:
         logger.warning("[review:%d] 无 diff 来源，跳过审查", review_id)
-        return {"overall_assessment": "", "files_count": 0, "issues": [], "score": "N/A"}
+        return {
+            "overall_assessment": "", "files_count": 0, "issues": [],
+            "score": "N/A", "dimension_stats": [], "comment_body": "",
+        }
     logger.info("[review:%d] 获取变更完成: %d 个文件 (%.1f秒)", review_id, len(changes), time.time() - t0)
 
     # 3. Run review engine
@@ -178,19 +170,13 @@ async def _do_review_async(
             review_result.tool_calls_count, time.time() - t0,
         )
 
-        # 4. Format and post comment
         comment_body = ReviewEngine.format_gitlab_comment(review_result, files_count)
 
-        t0 = time.time()
-        if trigger_type == "merge_request" and mr_iid:
-            await gitlab.post_mr_note(project_id, mr_iid, comment_body)
-            logger.info("[review:%d] 评论已发布到 GitLab MR#%s (%.1f秒)", review_id, mr_iid, time.time() - t0)
-        else:
-            await gitlab.post_commit_comment(project_id, commit_sha, comment_body)
-            logger.info("[review:%d] 评论已发布到 GitLab 提交 %s (%.1f秒)", review_id, commit_sha[:8], time.time() - t0)
-
-        # 5. Update local repo to latest
-        await repo_mgr.update_repo(project_name, branch)
+        # 更新本地仓库，失败不影响审查结果
+        try:
+            await repo_mgr.update_repo(project_name, branch)
+        except Exception:
+            logger.warning("[review:%d] 仓库更新失败（不影响审查结果）", review_id, exc_info=True)
     finally:
         await engine.aclose()
 
@@ -199,4 +185,70 @@ async def _do_review_async(
         "files_count": files_count,
         "issues": review_result.issues,
         "score": review_result.score,
+        "dimension_stats": review_result.dimension_stats,
+        "comment_body": comment_body,
     }
+
+
+async def _post_comment_async(
+    trigger_type: str,
+    project_id: int,
+    mr_iid: int | None,
+    commit_sha: str,
+    comment_body: str,
+    review_id: int,
+) -> None:
+    """发送评论到 GitLab。"""
+    gitlab = GitLabClient()
+    t0 = time.time()
+    if trigger_type == "merge_request" and mr_iid:
+        await gitlab.post_mr_note(project_id, mr_iid, comment_body)
+        logger.info("[review:%d] 评论已发布到 GitLab MR#%s (%.1f秒)",
+                     review_id, mr_iid, time.time() - t0)
+    else:
+        await gitlab.post_commit_comment(project_id, commit_sha, comment_body)
+        logger.info("[review:%d] 评论已发布到 GitLab 提交 %s (%.1f秒)",
+                     review_id, commit_sha[:8], time.time() - t0)
+
+
+def _save_review_result(review_id: int, result: dict) -> None:
+    """持久化审查结果到数据库。"""
+    t0 = time.time()
+    with SyncSession() as session:
+        review_obj = session.get(Review, review_id)
+        review_obj.status = ReviewStatus.completed
+        review_obj.summary = result["overall_assessment"]
+        review_obj.files_reviewed = result["files_count"]
+        review_obj.issues_found = len(result["issues"])
+        review_obj.completed_at = datetime.utcnow()
+
+        for issue in result["issues"]:
+            comment = ReviewComment(
+                review_id=review_id,
+                file_path=issue.get("file_path", ""),
+                line_start=issue.get("line_start"),
+                line_end=issue.get("line_end"),
+                severity=Severity(issue.get("severity", "info")),
+                category=issue.get("category", ""),
+                content=issue.get("content", ""),
+                suggestion=issue.get("suggestion"),
+                code_snippet=issue.get("code_snippet"),
+                dimension=issue.get("dimension"),
+            )
+            session.add(comment)
+        session.commit()
+    logger.info("[review:%d] 结果已持久化到数据库 (%.1f秒)", review_id, time.time() - t0)
+
+
+def _mark_review_failed(review_id: int, exc: Exception) -> None:
+    """标记审查任务失败。"""
+    try:
+        with SyncSession() as session:
+            review_obj = session.get(Review, review_id)
+            if review_obj:
+                review_obj.status = ReviewStatus.failed
+                review_obj.error_message = str(exc)[:2000]
+                review_obj.completed_at = datetime.utcnow()
+                session.commit()
+    except Exception:
+        logger.error("[review:%d] 标记失败状态时数据库写入也失败", review_id)

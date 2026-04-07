@@ -25,6 +25,10 @@ class LLMClient:
         max_tokens: int = 8192,
     ) -> ChatCompletionMessage:
         """Send a chat completion request, optionally with tools."""
+        from src.core.context_manager import trim_messages
+
+        messages = trim_messages(messages, reserve_for_completion=max_tokens)
+
         kwargs = {
             "model": self._model,
             "messages": messages,

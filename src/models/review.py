@@ -68,6 +68,7 @@ class ReviewComment(Base):
     content: Mapped[str] = mapped_column(Text)
     suggestion: Mapped[str | None] = mapped_column(Text, nullable=True)
     code_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dimension: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

@@ -61,8 +61,10 @@ alembic upgrade head
 
 ### Webhook Trigger Logic
 
-- **MR 事件**: `object_kind == "merge_request"` && `action == "merge"` && target_branch 在 MAIN_BRANCHES 中
-- **Push 事件**: `object_kind == "push"` && ref 指向主分支 && before 非全零 && 有 commits
+- **MR 事件**: `object_kind == "merge_request"` && `action in {"open", "update", "reopen", "merge"}` && target_branch 在 MAIN_BRANCHES 中
+  - `open/update/reopen`: 审查源分支代码，结果写入 MR 评论（预防性审查）
+  - `merge`: 审查合并后代码，结果写入 MR 评论（最终确认）
+- **Push 事件**: `object_kind == "push"` && before 非全零 && 有 commits（所有分支均触发，不再限制主分支）
 
 ### Database
 

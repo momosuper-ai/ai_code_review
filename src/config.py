@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_ROUNDS: int = 10
     AGENT_FORMAT_RETRY_MAX: int = 3
 
+    # 上下文长度管理
+    LLM_MAX_CONTEXT_TOKENS: int = 256000       # 模型最大上下文 token 数
+    LLM_CONTEXT_THRESHOLD: float = 0.9         # 触发裁剪的阈值（0.9 = 230,400 tokens）
+    LLM_CHARS_PER_TOKEN: float = 3.0           # 字符/token 估算比（中英混合+代码）
+
+    # 多Agent并行审查
+    REVIEW_DIMENSIONS_ENABLED: str = "bug,security,performance,quality,architecture"
+    REVIEW_MAX_CONCURRENCY: int = 3
+    REVIEW_DIMENSION_MAX_ROUNDS: int = 6
+    REVIEW_DIMENSION_TIMEOUT: int = 180
+    REVIEW_SINGLE_AGENT_MODE: bool = False
+
     # Main branches to trigger review
     MAIN_BRANCHES: str = "main,master"
 
@@ -60,6 +72,10 @@ class Settings(BaseSettings):
     @property
     def api_key_list(self) -> list[str]:
         return [k.strip() for k in self.API_KEYS.split(",") if k.strip()]
+
+    @property
+    def enabled_dimensions(self) -> list[str]:
+        return [d.strip() for d in self.REVIEW_DIMENSIONS_ENABLED.split(",") if d.strip()]
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

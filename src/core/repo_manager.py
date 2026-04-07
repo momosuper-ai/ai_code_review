@@ -78,7 +78,10 @@ class RepoManager:
             with lock:
                 if os.path.isdir(os.path.join(repo_dir, ".git")):
                     logger.info("拉取已有仓库: %s", project_path)
-                    self._run_git(["fetch", "origin", branch], cwd=repo_dir)
+                    self._run_git(
+                        ["fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                        cwd=repo_dir,
+                    )
                     self._run_git(
                         ["reset", "--hard", f"origin/{branch}"], cwd=repo_dir
                     )
@@ -100,7 +103,10 @@ class RepoManager:
         def _sync():
             logger.debug("获取文件锁: %s", self._lock_path(repo_dir))
             with lock:
-                self._run_git(["fetch", "origin", branch], cwd=repo_dir)
+                self._run_git(
+                    ["fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                    cwd=repo_dir,
+                )
                 self._run_git(
                     ["reset", "--hard", f"origin/{branch}"], cwd=repo_dir
                 )

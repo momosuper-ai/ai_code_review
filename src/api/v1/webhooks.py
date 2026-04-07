@@ -31,19 +31,23 @@ async def gitlab_webhook(
         return {"status": "ignored", "reason": f"unsupported event: {object_kind}"}
 
 
+_MR_REVIEW_ACTIONS = {"open", "update", "reopen", "merge"}
+
+
 def _handle_mr(payload: dict) -> dict:
     attrs = payload.get("object_attributes", {})
     action = attrs.get("action")
     target_branch = attrs.get("target_branch", "")
+    source_branch = attrs.get("source_branch", "")
     project = payload.get("project", {})
     project_name = project.get("path_with_namespace", "")
 
-    if action != "merge":
+    if action not in _MR_REVIEW_ACTIONS:
         logger.debug(
-            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s 原因=action=%s 非 merge",
+            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s 原因=action=%s 不在审查触发列表中",
             project_name, action,
         )
-        return {"status": "ignored", "reason": f"action={action}, not merge"}
+        return {"status": "ignored", "reason": f"action={action}, not reviewable"}
 
     if target_branch not in settings.main_branch_list:
         logger.debug(
@@ -60,10 +64,12 @@ def _handle_mr(payload: dict) -> dict:
     mr_title = attrs.get("title", "")
     commit_sha = (attrs.get("last_commit") or {}).get("id", "")
     author = (payload.get("user") or {}).get("username", "unknown")
+    # 合并事件使用目标分支，其他事件使用源分支（代码在源分支上）
+    branch = target_branch if action == "merge" else source_branch
 
     logger.info(
-        "收到合并请求事件: 项目=%s MR=%s 分支=%s",
-        project_name, mr_iid, target_branch,
+        "收到合并请求事件: 项目=%s MR=%s action=%s 分支=%s",
+        project_name, mr_iid, action, branch,
     )
 
     from src.tasks.review_task import run_review
@@ -72,7 +78,7 @@ def _handle_mr(payload: dict) -> dict:
         trigger_type="merge_request",
         project_id=project_id,
         project_name=project_name,
-        branch=target_branch,
+        branch=branch,
         commit_sha=commit_sha,
         author=author,
         mr_iid=mr_iid,
@@ -94,16 +100,6 @@ def _handle_push(payload: dict) -> dict:
 
     project = payload.get("project", {})
     project_name = project.get("path_with_namespace", "")
-
-    if branch not in settings.main_branch_list:
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=push 项目=%s 原因=分支 %s 不在主分支列表中",
-            project_name, branch,
-        )
-        return {
-            "status": "ignored",
-            "reason": f"branch={branch} not in main branches",
-        }
 
     if before == _NULL_SHA:
         logger.debug(
