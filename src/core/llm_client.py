@@ -10,12 +10,17 @@ from src.utils.logger import logger
 
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, model_name: str | None = None):
         self._client = AsyncOpenAI(
             base_url=settings.VLLM_API_URL,
             api_key=settings.VLLM_API_KEY,
         )
-        self._model = settings.VLLM_MODEL_NAME
+        self._model = model_name or settings.VLLM_MODEL_NAME
+        self._privacy_filter = None  # PrivacyFilter | None
+
+    def set_privacy_filter(self, pf) -> None:
+        """注入隐私过滤器，chat() 调用时自动脱敏。"""
+        self._privacy_filter = pf
 
     async def chat(
         self,
@@ -28,6 +33,10 @@ class LLMClient:
         from src.core.context_manager import trim_messages
 
         messages = trim_messages(messages, reserve_for_completion=max_tokens)
+
+        # 隐私过滤：脱敏后再发送
+        if self._privacy_filter:
+            messages = self._privacy_filter.sanitize_messages(messages)
 
         kwargs = {
             "model": self._model,

@@ -221,12 +221,14 @@ class DimensionAgent:
         tools: AgentToolExecutor,
         max_rounds: int,
         review_id: int | None = None,
+        privacy_filter=None,
     ):
         self.dimension = dimension
         self.llm = llm
         self.tools = tools
         self.max_rounds = max_rounds
         self.review_id = review_id
+        self.privacy_filter = privacy_filter
 
     async def run(self, diff_prompt: str) -> DimensionResult:
         """执行该维度的完整 agent tool-calling 循环。"""
@@ -271,6 +273,7 @@ class DimensionAgent:
                     tc.function.arguments = "{}"
 
             messages.append(response)
+            tool_outputs = []
             for tc in response.tool_calls:
                 args = parsed_args_map[tc.id]
 
@@ -287,11 +290,16 @@ class DimensionAgent:
                     status, tool_ms,
                 )
 
+                tool_outputs.append(tool_result.output)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": tool_result.output,
                 })
+
+            # 本轮工具结果批量扫描（发现新敏感模式）
+            if self.privacy_filter and tool_outputs:
+                await self.privacy_filter.scan_tool_results(tool_outputs)
 
         # Max rounds reached
         logger.warning("%s达到最大工具轮次 (%d)，请求最终输出", tag, self.max_rounds)
@@ -341,13 +349,33 @@ class DimensionAgent:
 class ReviewEngine:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
-        self.llm = LLMClient()
         self.tools = AgentToolExecutor(repo_path)
         self.max_rounds = settings.AGENT_MAX_TOOL_ROUNDS
+
+        # 双模型 + 隐私过滤
+        if settings.PRIVACY_FILTER_ENABLED and settings.CLOUD_LLM_MODEL_NAME:
+            from src.core.privacy_filter import PrivacyFilter
+
+            self.local_llm = LLMClient()  # 默认本地模型
+            self.llm = LLMClient(model_name=settings.CLOUD_LLM_MODEL_NAME)
+            self.privacy_filter = PrivacyFilter(local_llm=self.local_llm)
+            self.llm.set_privacy_filter(self.privacy_filter)
+            logger.info(
+                "双模型模式: 云端=%s 本地=%s 隐私过滤=%s",
+                settings.CLOUD_LLM_MODEL_NAME,
+                settings.VLLM_MODEL_NAME,
+                settings.PRIVACY_FILTER_LEVEL,
+            )
+        else:
+            self.llm = LLMClient()
+            self.local_llm = None
+            self.privacy_filter = None
 
     async def aclose(self):
         """关闭底层 LLM 客户端。"""
         await self.llm.aclose()
+        if self.local_llm:
+            await self.local_llm.aclose()
 
     async def __aenter__(self):
         return self
@@ -397,9 +425,46 @@ class ReviewEngine:
                 score="A",
             )
 
+        # Phase 1: Diff 隐私预扫描
+        if self.privacy_filter:
+            diff_text = self._build_diff_prompt(changes)
+            await self.privacy_filter.pre_scan(diff_text)
+
         if settings.REVIEW_SINGLE_AGENT_MODE:
-            return await self._run_single_agent(changes, review_id)
-        return await self._run_multi_agent(changes, review_id)
+            result = await self._run_single_agent(changes, review_id)
+        else:
+            result = await self._run_multi_agent(changes, review_id)
+
+        # Phase 3: 结果反脱敏
+        if self.privacy_filter:
+            result = self._desanitize_result(result)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Privacy desanitization
+    # ------------------------------------------------------------------
+
+    def _desanitize_result(self, result: ReviewResult) -> ReviewResult:
+        """还原审查结果中的占位符为原始值。"""
+        pf = self.privacy_filter
+        if not pf:
+            return result
+
+        result.overall_assessment = pf.desanitize_text(result.overall_assessment)
+        for issue in result.issues:
+            for key in ("content", "suggestion", "file_path", "code_snippet"):
+                if issue.get(key):
+                    issue[key] = pf.desanitize_text(issue[key])
+        result.highlights = [pf.desanitize_text(h) for h in result.highlights]
+
+        # Desanitize dimension stats assessments
+        for stat in result.dimension_stats:
+            if stat.get("assessment"):
+                stat["assessment"] = pf.desanitize_text(stat["assessment"])
+
+        logger.info("结果反脱敏完成: 映射表大小=%d", pf._mapping.count)
+        return result
 
     # ------------------------------------------------------------------
     # Single-agent mode (original logic)
@@ -447,6 +512,7 @@ class ReviewEngine:
                     tc.function.arguments = "{}"
 
             messages.append(response)
+            tool_outputs = []
             for tc in response.tool_calls:
                 args = parsed_args_map[tc.id]
 
@@ -463,11 +529,16 @@ class ReviewEngine:
                     status, tool_ms,
                 )
 
+                tool_outputs.append(tool_result.output)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": tool_result.output,
                 })
+
+            # 本轮工具结果批量扫描（发现新敏感模式）
+            if self.privacy_filter and tool_outputs:
+                await self.privacy_filter.scan_tool_results(tool_outputs)
 
         # Max rounds reached
         logger.warning("%s达到最大工具轮次 (%d)，请求最终输出", tag, self.max_rounds)
@@ -504,7 +575,8 @@ class ReviewEngine:
 
         agents = [
             DimensionAgent(dim, self.llm, self.tools,
-                           settings.REVIEW_DIMENSION_MAX_ROUNDS, review_id)
+                           settings.REVIEW_DIMENSION_MAX_ROUNDS, review_id,
+                           privacy_filter=self.privacy_filter)
             for dim in dimensions
         ]
         semaphore = asyncio.Semaphore(settings.REVIEW_MAX_CONCURRENCY)

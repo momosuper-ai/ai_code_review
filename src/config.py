@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     # IP 白名单（逗号分隔，支持单 IP 和 CIDR，空值 = 开发模式免限制）
     IP_WHITELIST: str = ""
 
+    # 云端审查模型（非空则启用双模型模式，与 VLLM_API_URL 共用同一中转服务）
+    CLOUD_LLM_MODEL_NAME: str = ""
+
+    # 隐私过滤
+    PRIVACY_FILTER_ENABLED: bool = False
+    PRIVACY_FILTER_LEVEL: str = "standard"       # minimal / standard / strict
+    PRIVACY_INTERNAL_DOMAINS: str = ""           # 逗号分隔的内部域名
+    PRIVACY_INTERNAL_CIDRS: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    PRIVACY_PRE_SCAN_ENABLED: bool = True        # 是否用本地模型做 diff 预扫描
+    PRIVACY_TOOL_SCAN_MODE: str = "hybrid"       # hybrid=规则+本地模型 / rules_only=仅规则
+    PRIVACY_CUSTOM_PATTERNS: str = ""            # 额外自定义正则（JSON 格式）
+
     # SonarQube（预留）
     SONARQUBE_URL: str = ""
     SONARQUBE_TOKEN: str = ""
