@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_ROUNDS: int = 10
     AGENT_FORMAT_RETRY_MAX: int = 3
 
+    # LLM 调用重试
+    LLM_RETRY_MAX: int = 3                    # 最大重试次数
+    LLM_RETRY_BASE_DELAY: float = 2.0         # 基础退避秒数
+    LLM_RETRY_MAX_DELAY: float = 30.0         # 最大退避秒数
+
     # 上下文长度管理
     LLM_MAX_CONTEXT_TOKENS: int = 256000       # 模型最大上下文 token 数
     LLM_CONTEXT_THRESHOLD: float = 0.9         # 触发裁剪的阈值（0.9 = 230,400 tokens）
