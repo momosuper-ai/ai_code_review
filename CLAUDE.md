@@ -2,9 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 工作流要求
+
+**每次会话开始时**：
+1. 阅读本文件 (CLAUDE.md) — 了解项目架构、约定和最新配置
+2. 阅读 `memory/MEMORY.md`（如果存在）— 了解稳定模式和已知注意事项
+3. 查看 `git status` — 了解当前工作状态
+
+**每次功能修改完成后**，检查以下文件是否需要同步更新：
+- **CLAUDE.md** — 新增模块/配置/端点/流程变更时必须更新
+- **.env.example** — 新增环境变量时必须追加
+- **memory/MEMORY.md** — 发现新的稳定模式或架构决策时更新
+
 ## Project Overview
 
-AI 代码审查服务：通过 GitLab Webhook 自动触发，利用 vLLM 大模型对代码变更进行审查，结果回写 GitLab。
+AI 代码审查服务：通过 GitLab Webhook 自动触发，支持本地 vLLM + 云端 LLM 双模型架构，对代码变更进行多维度并行审查（5个专业维度Agent），内置隐私过滤保护敏感数据，结果回写 GitLab。
 
 ## Build & Run
 
@@ -32,29 +44,39 @@ alembic upgrade head
 
 ## Architecture
 
-**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine agent loop → GitLab comment
+**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment
 
 ### Core Pipeline (src/tasks/review_task.py)
 
-1. 创建 Review 数据库记录
+1. 创建 Review 数据库记录（status: in_progress）
 2. `RepoManager` clone/fetch 本地代码库（filelock 防并发）
 3. `GitLabClient` 获取 MR diff 或 commit compare
 4. `ReviewEngine.filter_diffs()` 过滤非代码文件
-5. `ReviewEngine.run_review()` — Agent tool-calling 循环（最多 10 轮），LLM 可调用 5 个沙箱工具探索代码上下文
-   - **格式重试纠正**: LLM 输出 JSON 解析失败时，最多重试 `AGENT_FORMAT_RETRY_MAX` 次（默认 3），使用递减温度 `[0.1, 0.05, 0.0]` 引导格式修正
+5. **隐私预扫描**（双模型模式）: `PrivacyFilter.pre_scan()` 规则引擎 + 本地LLM 混合扫描 diff 中的敏感数据，构建脱敏映射表
+6. `ReviewEngine.run_review()` — 两种运行模式:
+   - **多Agent模式**（默认）: 5 个 `DimensionAgent` 通过 `asyncio.gather` + `Semaphore` 并行审查，每维度独立 tool-calling 循环（最多 `REVIEW_DIMENSION_MAX_ROUNDS` 轮），结果经去重 + 加权合并
+   - **单Agent模式**: 单一 Agent 全维度审查（最多 `AGENT_MAX_TOOL_ROUNDS` 轮）
+   - **格式重试纠正**: JSON 解析失败时最多重试 `AGENT_FORMAT_RETRY_MAX` 次，温度递减 `[0.1, 0.05, 0.0]`
    - **降级 fallback 解析**: 重试仍失败时，用正则提取部分结构化信息
-6. 格式化 Markdown 评论，回写 GitLab（MR note 或 commit comment）
-7. 持久化 Review + ReviewComment 到 PostgreSQL
+   - **工具结果隐私扫描**: 每轮工具调用后批量扫描结果中的新敏感模式
+7. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
+8. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
+9. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
 
 ### Key Modules
 
-- **src/core/review_engine.py** — Agent 审查引擎：构建 system prompt、驱动 LLM tool-calling 循环、解析 JSON 结果、格式化 GitLab 评论
+- **src/core/review_engine.py** — Agent 审查引擎：`ReviewEngine` 总控（单/多Agent模式切换）、`DimensionAgent` 维度Agent（独立 tool-calling 循环）、结果解析/去重/加权评分、隐私反脱敏、双格式 GitLab 评论
 - **src/core/agent_tools.py** — 5 个沙箱工具（read_file, search_code, list_directory, find_definition, get_file_info），`AgentToolExecutor` 基类做路径越界检查和输出截断（20000 字符 / 500 行上限）；`find_definition` 支持 10+ 语言的定义正则匹配
-- **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)
+- **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
 - **src/core/gitlab_client.py** — httpx async 客户端，5 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`）
 - **src/core/repo_manager.py** — Git 仓库生命周期管理，oauth2 token 注入 clone URL
+- **src/core/privacy_filter.py** — 隐私过滤核心：`SanitizationMapping` 双向映射（original ↔ `<<TYPE_N>>` 占位符）、`PrivacyFilter` 3阶段过滤（`pre_scan` diff预扫描 → `scan_tool_results` 工具结果扫描 → `desanitize_text` 反脱敏）、规则引擎 + 本地LLM混合扫描
+- **src/core/privacy_rules.py** — 敏感数据检测规则库：7类规则（KEY/SECRET/IP/DOMAIN/EMAIL/CERT/CUSTOM）、3个检测等级（minimal仅密钥密码/standard+IP邮箱/strict+高熵字符串）
+- **src/core/dimensions.py** — 多维度审查定义：5个 `ReviewDimension`（bug 30%/security 25%/performance 15%/quality 15%/architecture 15%）、维度专属 System Prompt、加权评分算法（任一维度D或存在critical → 最终评级 ≤ C）
+- **src/core/context_manager.py** — 上下文长度管理：Token 字符估算、4阶段消息裁剪（工具结果截断2000字符 → 参数感知摘要替换 → 历史工具组移除 → Diff截断60%预算），保护 system+user 头部和尾部4条消息
 - **src/utils/security.py** — Webhook Token 验证（`verify_gitlab_token`）+ API Key 认证（`require_api_key`），未配置时默认放行（开发模式）
 - **src/utils/rate_limit.py** — Redis 固定窗口速率限制器，`rate_limit_dependency()` 工厂函数返回 FastAPI 依赖；Redis 故障时 fail-open
+- **src/utils/ip_whitelist.py** — `IPWhitelistMiddleware` IP白名单中间件，支持IPv4/IPv6 CIDR，`/health` 始终放行，未配置时全部放行（开发模式）
 - **src/api/v1/reviews.py** — 审查记录查询 API（分页列表 + 详情），路由 `/api/v1/reviews`
 - **src/schemas/webhook.py** — Webhook 请求体 Pydantic schema（`MergeRequestEvent`, `PushEvent`）
 - **src/api/router.py** — API 路由聚合，前缀 `/api/v1`
@@ -72,6 +94,8 @@ PostgreSQL + SQLAlchemy 双引擎设计。两张表：`reviews`（审查记录�
 
 - FastAPI 使用异步引擎（`asyncpg`）
 - Celery Worker 使用同步引擎（`psycopg2`），通过 `DATABASE_URL_SYNC` property 自动转换
+- `review_comments` 表新增 `dimension` 字段（String(50), nullable），记录问题所属审查维度
+- Alembic 迁移: `alembic/versions/001_add_dimension_to_review_comments.py`
 
 ### API Endpoints
 
@@ -112,6 +136,29 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - Webhook 安全：通过 `X-Gitlab-Token` header 验证，由 `src/utils/security.py` 实现；未配置 `GITLAB_WEBHOOK_SECRET` 时默认放行（仅限开发环境）
 - API Key 认证：Reviews API 通过 `X-API-Key` header 验证，未配置 `API_KEYS` 时默认放行（开发模式）；生成密钥：`python -c "import secrets; print(secrets.token_urlsafe(32))"`
 - 速率限制：基于 Redis 固定窗口计数器，按 `{client_ip}:{path}` 限流；Redis 故障时 fail-open；超限返回 429 + `Retry-After` header
+- IP 白名单：`IPWhitelistMiddleware` 实现，配置 `IP_WHITELIST`（逗号分隔 IP/CIDR），`/health` 始终放行；未配置时全部放行（开发模式）
+
+### 双模型与隐私过滤
+
+- **双模型模式**: `CLOUD_LLM_MODEL_NAME` 非空且 `PRIVACY_FILTER_ENABLED=true` 时启用；本地 vLLM 负责隐私扫描，云端 LLM 负责代码审查
+- **单模型模式**: `CLOUD_LLM_MODEL_NAME` 为空时仅使用本地 vLLM，不启用隐私过滤
+- 隐私过滤通过 `LLMClient.set_privacy_filter()` 注入，`chat()` 自动脱敏消息（含 tool_calls 参数）
+- 占位符格式: `<<TYPE_N>>`（如 `<<KEY_1>>`、`<<IP_3>>`），同一值始终映射同一占位符
+- 3阶段流程: pre_scan(diff) → scan_tool_results(每轮) → desanitize_text(最终结果)
+
+### 多维度审查
+
+- 5个维度: bug(30%)、security(25%)、performance(15%)、quality(15%)、architecture(15%)
+- 每个 `DimensionAgent` 有独立 system prompt、categories 限制和 tool-calling 循环
+- 并发: `asyncio.Semaphore(REVIEW_MAX_CONCURRENCY)` + `asyncio.wait_for(timeout)` 超时保护
+- 结果合并: 跨维度去重（同位置+同分类保留高严重度）→ 加权评分（任一D或critical强制降至C）
+- 评论格式: 多维度模式输出维度分组问题列表 + 可折叠详情表格
+- `REVIEW_SINGLE_AGENT_MODE=true` 可回退到单Agent全维度审查
+
+### LLM 调用配置
+
+- **重试机制**: 指数退避 `base_delay * 2^attempt + random()`，可重试异常: RateLimitError、APIConnectionError、HTTP 500/502/503/529，最多 `LLM_RETRY_MAX` 次
+- **上下文管理**: `chat()` 每次调用前自动 `trim_messages()`，预算 = `LLM_MAX_CONTEXT_TOKENS × LLM_CONTEXT_THRESHOLD - max_tokens`
 
 ## 部署注意事项
 
@@ -158,3 +205,69 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - 优先捕获具体异常类型（如 `httpx.HTTPStatusError`），避免裸 `except Exception`
 - 工具执行结果统一使用 `ToolResult` dataclass 封装
 - 关键操作必须有 logger 记录（含耗时信息）
+
+## Configuration Reference
+
+### 隐私过滤
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `PRIVACY_FILTER_ENABLED` | `false` | 启用隐私过滤 |
+| `PRIVACY_FILTER_LEVEL` | `standard` | 检测等级: minimal/standard/strict |
+| `PRIVACY_INTERNAL_DOMAINS` | `""` | 逗号分隔内部域名 |
+| `PRIVACY_INTERNAL_CIDRS` | RFC1918 | 内部IP段 |
+| `PRIVACY_PRE_SCAN_ENABLED` | `true` | 本地模型diff预扫描 |
+| `PRIVACY_TOOL_SCAN_MODE` | `hybrid` | hybrid=规则+模型 / rules_only=仅规则 |
+| `PRIVACY_CUSTOM_PATTERNS` | `""` | 自定义正则（JSON数组） |
+
+### 云端LLM
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `CLOUD_LLM_MODEL_NAME` | `""` | 云端模型名，非空启用双模型模式 |
+
+### 多维度审查
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `REVIEW_DIMENSIONS_ENABLED` | `bug,security,...` | 启用的维度列表 |
+| `REVIEW_MAX_CONCURRENCY` | `3` | 维度Agent并发数 |
+| `REVIEW_DIMENSION_MAX_ROUNDS` | `6` | 每维度最大工具轮次 |
+| `REVIEW_DIMENSION_TIMEOUT` | `180` | 每维度超时秒数 |
+| `REVIEW_SINGLE_AGENT_MODE` | `false` | 回退单Agent模式 |
+
+### LLM重试
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LLM_RETRY_MAX` | `3` | 最大重试次数 |
+| `LLM_RETRY_BASE_DELAY` | `2.0` | 基础退避秒数 |
+| `LLM_RETRY_MAX_DELAY` | `30.0` | 最大退避秒数 |
+
+### 上下文管理
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LLM_MAX_CONTEXT_TOKENS` | `256000` | 模型最大上下文token |
+| `LLM_CONTEXT_THRESHOLD` | `0.9` | 触发裁剪阈值 |
+| `LLM_CHARS_PER_TOKEN` | `3.0` | 字符/token估算比 |
+
+### 速率限制
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `RATE_LIMIT_ENABLED` | `true` | 启用速率限制 |
+| `RATE_LIMIT_WEBHOOK` | `30/minute` | Webhook端点限流 |
+| `RATE_LIMIT_REVIEWS` | `60/minute` | Reviews API限流 |
+| `RATE_LIMIT_DEFAULT` | `120/minute` | 默认限流 |
+
+### Celery
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `CELERY_CONCURRENCY` | `2` | Worker并发数 |
+| `CELERY_LOG_LEVEL` | `info` | Worker日志级别 |
+
+## Tests
+
+单元测试位于 `tests/unit/`，使用 pytest：
+
+- `test_agent_tools.py` — AgentToolExecutor 沙箱工具测试
+- `test_context_manager.py` — 上下文裁剪逻辑测试
+- `test_dimensions.py` — 维度定义和格式重试提示测试
+- `test_privacy_filter.py` — 隐私过滤规则和脱敏/反脱敏测试
+- `test_review_engine.py` — 审查引擎解析和格式化测试
+- `test_webhooks.py` — Webhook 路由和事件处理测试
