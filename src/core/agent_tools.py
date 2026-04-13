@@ -55,10 +55,11 @@ class ToolResult:
 class AgentToolExecutor:
     """Sandboxed tool executor scoped to a single repo directory."""
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, code_graph=None):
         self.repo_path = os.path.realpath(repo_path)
         if not os.path.isdir(self.repo_path):
             raise ValueError(f"Repo path does not exist: {self.repo_path}")
+        self._code_graph = code_graph
 
     def _safe_resolve(self, relative_path: str) -> str:
         """Resolve path and verify it stays within repo_path."""
@@ -346,6 +347,59 @@ class AgentToolExecutor:
         except Exception as e:
             return ToolResult(success=False, output=f"Error getting file info: {e}")
 
+    # ── Tool: get_blast_radius ──────────────────────────────────────
+
+    def get_blast_radius(
+        self,
+        file_path: str,
+        symbol: str | None = None,
+        depth: int = 2,
+    ) -> ToolResult:
+        """Analyze the blast radius of a code change using the code graph."""
+        if self._code_graph is None or not self._code_graph.available():
+            return ToolResult(
+                success=False,
+                output="代码图不可用，请使用 search_code 或 find_definition 替代。",
+            )
+        try:
+            # 路径沙箱校验：确保 file_path 不越界
+            self._safe_resolve(file_path)
+            # 规范化为正斜杠相对路径（与代码图存储格式一致）
+            normalized = file_path.lstrip("/").lstrip("\\").replace("\\", "/")
+
+            results = self._code_graph.get_blast_radius(
+                normalized, symbol=symbol, depth=min(depth, 3),
+            )
+            if not results:
+                return ToolResult(
+                    success=True,
+                    output=f"未找到 {file_path} 中的匹配符号。",
+                )
+
+            parts: list[str] = []
+            for br in results:
+                lines = [f"### {br.target} ({br.target_location})"]
+                if br.upstream_callers:
+                    lines.append(f"  上游调用者 ({len(br.upstream_callers)}):")
+                    for c in br.upstream_callers[:15]:
+                        lines.append(f"    - {c['kind']} {c['name']} @ {c['location']}")
+                if br.downstream_callees:
+                    lines.append(f"  下游被调用 ({len(br.downstream_callees)}):")
+                    for c in br.downstream_callees[:15]:
+                        loc = c['location'] or '(external)'
+                        lines.append(f"    - {c['kind']} {c['name']} @ {loc}")
+                if br.siblings:
+                    lines.append(f"  同文件兄弟符号: {', '.join(s['name'] for s in br.siblings)}")
+                parts.append("\n".join(lines))
+
+            content = "\n\n".join(parts)
+            content, truncated = self._truncate(content)
+            return ToolResult(success=True, output=content, truncated=truncated)
+        except ValueError as e:
+            return ToolResult(success=False, output=str(e))
+        except Exception as e:
+            return ToolResult(success=False, output=f"影响面分析失败: {e}")
+
     @staticmethod
     def _is_binary(filepath: str) -> bool:
         try:
@@ -505,6 +559,38 @@ class AgentToolExecutor:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_blast_radius",
+                    "description": (
+                        "分析代码变更的影响面：给定一个文件路径和可选的符号名，"
+                        "利用代码图查询该符号的上游调用者（谁调用了它）和下游被调用者（它调用了谁），"
+                        "帮助你判断变更可能影响的范围。"
+                        "适用场景：评估修改某个函数/类后会影响哪些模块；"
+                        "判断一个 bug fix 是否会引入回归风险；理解代码的依赖拓扑关系。"
+                        "注意：此工具依赖代码图索引，如果代码图不可用，请改用 search_code 或 find_definition。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "相对于仓库根目录的文件路径，例如 'src/core/review_engine.py'",
+                            },
+                            "symbol": {
+                                "type": "string",
+                                "description": "要分析的符号名称（函数名、类名等）。省略则分析文件中所有函数/方法/类",
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "追溯深度，默认 2，最大 3。depth=1 仅看直接调用者/被调用者，depth=2 可看间接影响",
+                            },
+                        },
+                        "required": ["file_path"],
+                    },
+                },
+            },
         ]
 
     def execute_tool(self, name: str, arguments: dict) -> ToolResult:
@@ -514,6 +600,7 @@ class AgentToolExecutor:
             "search_code": ["pattern"],
             "find_definition": ["symbol"],
             "get_file_info": ["paths"],
+            "get_blast_radius": ["file_path"],
         }
         if name in required_params:
             missing = [p for p in required_params[name] if p not in arguments]
@@ -537,6 +624,9 @@ class AgentToolExecutor:
                 args["symbol"], args.get("file_pattern")
             ),
             "get_file_info": lambda args: self.get_file_info(args["paths"]),
+            "get_blast_radius": lambda args: self.get_blast_radius(
+                args["file_path"], args.get("symbol"), args.get("depth", 2)
+            ),
         }
 
         handler = dispatch.get(name)

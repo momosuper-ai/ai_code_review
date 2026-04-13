@@ -19,6 +19,8 @@ class LLMClient:
         )
         self._model = model_name or settings.VLLM_MODEL_NAME
         self._privacy_filter = None  # PrivacyFilter | None
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
 
     def set_privacy_filter(self, pf) -> None:
         """注入隐私过滤器，chat() 调用时自动脱敏。"""
@@ -70,6 +72,9 @@ class LLMClient:
                 response = await self._client.chat.completions.create(**kwargs)
                 duration_ms = (time.time() - t0) * 1000
                 usage = response.usage
+                if usage:
+                    self.total_prompt_tokens += usage.prompt_tokens
+                    self.total_completion_tokens += usage.completion_tokens
                 logger.info(
                     "LLM 调用: 模型=%s 消息数=%d 工具=%s token用量=%s (%.0f毫秒)",
                     self._model,

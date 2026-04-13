@@ -102,10 +102,14 @@ def run_review(
             logger.error("[review:%d] GitLab 评论发送失败", review_id, exc_info=True)
 
         total_time = time.time() - task_start
+        total_tokens = result.get("total_prompt_tokens", 0) + result.get("total_completion_tokens", 0)
         logger.info(
-            "[review:%d] 审查流程结束: 文件数=%d 问题数=%d 评级=%s 总耗时=%.1f秒",
+            "[review:%d] 审查流程结束: 文件数=%d 问题数=%d 评级=%s 总耗时=%.1f秒 token用量=%d(输入:%d/输出:%d)",
             review_id, result["files_count"], len(result["issues"]),
             result["score"], total_time,
+            total_tokens,
+            result.get("total_prompt_tokens", 0),
+            result.get("total_completion_tokens", 0),
         )
 
     except Exception as exc:
@@ -136,7 +140,16 @@ async def _do_review_async(
     repo_dir = await repo_mgr.ensure_repo(project_name, branch)
     logger.info("[review:%d] 仓库准备就绪 (%.1f秒)", review_id, time.time() - t0)
 
-    # 2. Get changes
+    # 2. Update code graph (non-blocking)
+    from src.core.code_graph.incremental import update_graph_incremental
+
+    t0 = time.time()
+    graph_summary = await asyncio.to_thread(
+        update_graph_incremental, repo_dir, before_sha, commit_sha,
+    )
+    logger.info("[review:%d] 代码图更新: %s (%.1f秒)", review_id, graph_summary, time.time() - t0)
+
+    # 3. Get changes
     t0 = time.time()
     if trigger_type == "merge_request" and mr_iid:
         data = await gitlab.get_mr_changes(project_id, mr_iid)
@@ -152,8 +165,11 @@ async def _do_review_async(
         }
     logger.info("[review:%d] 获取变更完成: %d 个文件 (%.1f秒)", review_id, len(changes), time.time() - t0)
 
-    # 3. Run review engine
-    engine = ReviewEngine(repo_dir)
+    # 4. Run review engine
+    from src.core.code_graph.query import CodeGraph
+
+    graph = CodeGraph(repo_dir)
+    engine = ReviewEngine(repo_dir, code_graph=graph if graph.available() else None)
     try:
         filtered = engine.filter_diffs(changes)
         files_count = len(filtered)
@@ -179,6 +195,7 @@ async def _do_review_async(
             logger.warning("[review:%d] 仓库更新失败（不影响审查结果）", review_id, exc_info=True)
     finally:
         await engine.aclose()
+        graph.close()
 
     return {
         "overall_assessment": review_result.overall_assessment,
@@ -187,6 +204,8 @@ async def _do_review_async(
         "score": review_result.score,
         "dimension_stats": review_result.dimension_stats,
         "comment_body": comment_body,
+        "total_prompt_tokens": review_result.total_prompt_tokens,
+        "total_completion_tokens": review_result.total_completion_tokens,
     }
 
 

@@ -77,6 +77,11 @@ class Settings(BaseSettings):
     PRIVACY_TOOL_SCAN_MODE: str = "hybrid"       # hybrid=规则+本地模型 / rules_only=仅规则
     PRIVACY_CUSTOM_PATTERNS: str = ""            # 额外自定义正则（JSON 格式）
 
+    # 代码图（影响面分析）
+    CODE_GRAPH_ENABLED: bool = True
+    CODE_GRAPH_LANGUAGES: str = "python,javascript,typescript,java,go"
+    CODE_GRAPH_MAX_FILES_FULL_SCAN: int = 5000
+
     # SonarQube（预留）
     SONARQUBE_URL: str = ""
     SONARQUBE_TOKEN: str = ""

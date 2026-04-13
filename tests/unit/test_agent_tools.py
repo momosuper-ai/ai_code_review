@@ -125,7 +125,7 @@ class TestExecuteTool:
 
     def test_tool_definitions_format(self):
         defs = AgentToolExecutor.tool_definitions()
-        assert len(defs) == 5
+        assert len(defs) == 6
         for d in defs:
             assert d["type"] == "function"
             assert "name" in d["function"]

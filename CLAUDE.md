@@ -50,23 +50,25 @@ alembic upgrade head
 
 1. 创建 Review 数据库记录（status: in_progress）
 2. `RepoManager` clone/fetch 本地代码库（filelock 防并发）
-3. `GitLabClient` 获取 MR diff 或 commit compare
-4. `ReviewEngine.filter_diffs()` 过滤非代码文件
-5. **隐私预扫描**（双模型模式）: `PrivacyFilter.pre_scan()` 规则引擎 + 本地LLM 混合扫描 diff 中的敏感数据，构建脱敏映射表
-6. `ReviewEngine.run_review()` — 两种运行模式:
+3. **代码图增量更新**: `update_graph_incremental()` 基于 git diff 更新 SQLite 代码图（首次全量扫描，后续增量），失败不阻塞审查
+4. `GitLabClient` 获取 MR diff 或 commit compare
+5. `ReviewEngine.filter_diffs()` 过滤非代码文件
+6. **隐私预扫描**（双模型模式）: `PrivacyFilter.pre_scan()` 规则引擎 + 本地LLM 混合扫描 diff 中的敏感数据，构建脱敏映射表
+7. `ReviewEngine.run_review()` — 两种运行模式:
    - **多Agent模式**（默认）: 5 个 `DimensionAgent` 通过 `asyncio.gather` + `Semaphore` 并行审查，每维度独立 tool-calling 循环（最多 `REVIEW_DIMENSION_MAX_ROUNDS` 轮），结果经去重 + 加权合并
    - **单Agent模式**: 单一 Agent 全维度审查（最多 `AGENT_MAX_TOOL_ROUNDS` 轮）
    - **格式重试纠正**: JSON 解析失败时最多重试 `AGENT_FORMAT_RETRY_MAX` 次，温度递减 `[0.1, 0.05, 0.0]`
    - **降级 fallback 解析**: 重试仍失败时，用正则提取部分结构化信息
    - **工具结果隐私扫描**: 每轮工具调用后批量扫描结果中的新敏感模式
-7. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
-8. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
-9. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
+8. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
+9. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
+10. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
 
 ### Key Modules
 
 - **src/core/review_engine.py** — Agent 审查引擎：`ReviewEngine` 总控（单/多Agent模式切换）、`DimensionAgent` 维度Agent（独立 tool-calling 循环）、结果解析/去重/加权评分、隐私反脱敏、双格式 GitLab 评论
-- **src/core/agent_tools.py** — 5 个沙箱工具（read_file, search_code, list_directory, find_definition, get_file_info），`AgentToolExecutor` 基类做路径越界检查和输出截断（20000 字符 / 500 行上限）；`find_definition` 支持 10+ 语言的定义正则匹配
+- **src/core/agent_tools.py** — 6 个沙箱工具（read_file, search_code, list_directory, find_definition, get_file_info, get_blast_radius），`AgentToolExecutor` 基类做路径越界检查和输出截断（20000 字符 / 500 行上限）；`find_definition` 支持 10+ 语言的定义正则匹配；`get_blast_radius` 利用代码图分析变更影响面（上游调用者/下游被调用者）
+- **src/core/code_graph/** — 代码图模块（影响面分析）：`parser.py` 多语言 AST/正则解析器（Python/JS/TS/Java/Go）；`store.py` SQLite 持久化存储 + FTS5 全文检索；`query.py` `CodeGraph` 高层查询 API（影响面 BFS 追溯）；`incremental.py` 基于 git diff 的增量更新（首次全量扫描，后续仅处理变更文件）
 - **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
 - **src/core/gitlab_client.py** — httpx async 客户端，5 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`）
 - **src/core/repo_manager.py** — Git 仓库生命周期管理，oauth2 token 注入 clone URL
@@ -219,6 +221,13 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | `PRIVACY_TOOL_SCAN_MODE` | `hybrid` | hybrid=规则+模型 / rules_only=仅规则 |
 | `PRIVACY_CUSTOM_PATTERNS` | `""` | 自定义正则（JSON数组） |
 
+### 代码图
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `CODE_GRAPH_ENABLED` | `true` | 启用代码图（影响面分析） |
+| `CODE_GRAPH_LANGUAGES` | `python,javascript,typescript,java` | 启用的语言列表 |
+| `CODE_GRAPH_MAX_FILES_FULL_SCAN` | `5000` | 全量扫描最大文件数，超过则跳过 |
+
 ### 云端LLM
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -271,3 +280,4 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - `test_privacy_filter.py` — 隐私过滤规则和脱敏/反脱敏测试
 - `test_review_engine.py` — 审查引擎解析和格式化测试
 - `test_webhooks.py` — Webhook 路由和事件处理测试
+- `test_code_graph.py` — 代码图解析器、存储、查询和影响面分析测试

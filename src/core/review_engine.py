@@ -129,6 +129,8 @@ class ReviewResult:
     highlights: list[str] = field(default_factory=list)
     tool_calls_count: int = 0
     dimension_stats: list[dict] = field(default_factory=list)
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
 
 
 @dataclass
@@ -347,9 +349,9 @@ class DimensionAgent:
 # ---------------------------------------------------------------------------
 
 class ReviewEngine:
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, code_graph=None):
         self.repo_path = repo_path
-        self.tools = AgentToolExecutor(repo_path)
+        self.tools = AgentToolExecutor(repo_path, code_graph=code_graph)
         self.max_rounds = settings.AGENT_MAX_TOOL_ROUNDS
 
         # 双模型 + 隐私过滤
@@ -434,6 +436,13 @@ class ReviewEngine:
             result = await self._run_single_agent(changes, review_id)
         else:
             result = await self._run_multi_agent(changes, review_id)
+
+        # Token 用量汇总
+        result.total_prompt_tokens = self.llm.total_prompt_tokens
+        result.total_completion_tokens = self.llm.total_completion_tokens
+        if self.local_llm:
+            result.total_prompt_tokens += self.local_llm.total_prompt_tokens
+            result.total_completion_tokens += self.local_llm.total_completion_tokens
 
         # Phase 3: 结果反脱敏
         if self.privacy_filter:
