@@ -225,7 +225,7 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `CODE_GRAPH_ENABLED` | `true` | 启用代码图（影响面分析） |
-| `CODE_GRAPH_LANGUAGES` | `python,javascript,typescript,java` | 启用的语言列表 |
+| `CODE_GRAPH_LANGUAGES` | `python,javascript,typescript,java,go` | 启用的语言列表 |
 | `CODE_GRAPH_MAX_FILES_FULL_SCAN` | `5000` | 全量扫描最大文件数，超过则跳过 |
 
 ### 云端LLM
