@@ -9,7 +9,7 @@
 - **安全沙箱**：LLM 只能通过 6 个受限工具（read_file, search_code, list_directory, find_definition, get_file_info, get_blast_radius）访问被审查项目的代码
 - **隐私过滤**：规则引擎 + LLM 混合扫描，3 阶段流水线（预扫描 -> 工具结果扫描 -> 反脱敏）自动保护敏感数据
 - **双模型架构**：本地 vLLM 负责隐私扫描，云端 LLM 负责代码审查（可选启用）
-- **代码图分析**：多语言 AST 解析构建代码图（Python/JS/TS/Java/Go），自动追溯变更影响面
+- **代码图分析**：多语言 AST 解析构建代码图（Python/JS/TS/Java/Go），基于 diff hunk 精确定位变更函数，仅追溯受影响符号的依赖关系
 - **安全防护**：Webhook Token 验证、API Key 认证、IP 白名单、Redis 速率限制
 - **智能容错**：LLM 调用指数退避重试、上下文自动裁剪、JSON 格式重试纠正、降级 fallback 解析
 - **结果回写**：审查报告格式化为 Markdown 评论，自动发布到 GitLab

@@ -44,7 +44,7 @@ alembic upgrade head
 
 ## Architecture
 
-**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment
+**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [影响面预分析 → 隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment
 
 ### Core Pipeline (src/tasks/review_task.py)
 
@@ -53,26 +53,28 @@ alembic upgrade head
 3. **代码图增量更新**: `update_graph_incremental()` 基于 git diff 更新 SQLite 代码图（首次全量扫描，后续增量），失败不阻塞审查
 4. `GitLabClient` 获取 MR diff 或 commit compare
 5. `ReviewEngine.filter_diffs()` 过滤非代码文件
-6. **隐私预扫描**（双模型模式）: `PrivacyFilter.pre_scan()` 规则引擎 + 本地LLM 混合扫描 diff 中的敏感数据，构建脱敏映射表
-7. `ReviewEngine.run_review()` — 两种运行模式:
+6. **影响面预分析**: `ReviewEngine._build_blast_radius_context()` 遍历变更文件，从 diff hunk header 解析变更行范围（`_parse_changed_lines`），通过区间重叠检测（`_ranges_overlap`）过滤出受影响的函数/方法/类节点，仅对这些节点调用 `get_blast_radius_for_nodes` 查询依赖关系（上游调用者/下游被调用者）；diff 无 hunk header 时 fallback 到全文件分析（`get_blast_radius`）；结果注入到 diff prompt 开头，让 Agent 从第一轮就了解变更的依赖拓扑；失败不阻塞审查
+7. **隐私预扫描**（双模型模式）: `PrivacyFilter.pre_scan()` 规则引擎 + 本地LLM 混合扫描 diff（含影响面文本）中的敏感数据，构建脱敏映射表
+8. `ReviewEngine.run_review()` — 两种运行模式:
    - **多Agent模式**（默认）: 5 个 `DimensionAgent` 通过 `asyncio.gather` + `Semaphore` 并行审查，每维度独立 tool-calling 循环（最多 `REVIEW_DIMENSION_MAX_ROUNDS` 轮），结果经去重 + 加权合并
    - **单Agent模式**: 单一 Agent 全维度审查（最多 `AGENT_MAX_TOOL_ROUNDS` 轮）
+   - **Token 统计**: 每次 `chat()` 返回 `ChatResult`（含 `TokenUsage`），各 Agent 本地累加后汇总到 `ReviewResult`（分维度 + 分模型）；`cached_tokens` 从 `usage.prompt_tokens_details` 提取
    - **格式重试纠正**: JSON 解析失败时最多重试 `AGENT_FORMAT_RETRY_MAX` 次，温度递减 `[0.1, 0.05, 0.0]`
    - **降级 fallback 解析**: 重试仍失败时，用正则提取部分结构化信息
    - **工具结果隐私扫描**: 每轮工具调用后批量扫描结果中的新敏感模式
-8. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
-9. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
-10. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
+9. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
+10. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
+11. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
 
 ### Key Modules
 
-- **src/core/review_engine.py** — Agent 审查引擎：`ReviewEngine` 总控（单/多Agent模式切换）、`DimensionAgent` 维度Agent（独立 tool-calling 循环）、结果解析/去重/加权评分、隐私反脱敏、双格式 GitLab 评论
+- **src/core/review_engine.py** — Agent 审查引擎：`ReviewEngine` 总控（单/多Agent模式切换）、`DimensionAgent` 维度Agent（独立 tool-calling 循环 + 本地 TokenUsage 累加）、结果解析/去重/加权评分、分维度+分模型 token 统计、隐私反脱敏、双格式 GitLab 评论；`_parse_changed_lines` 解析 diff hunk 变更行范围、`_ranges_overlap` 区间重叠检测，用于精确化影响面预注入
 - **src/core/agent_tools.py** — 6 个沙箱工具（read_file, search_code, list_directory, find_definition, get_file_info, get_blast_radius），`AgentToolExecutor` 基类做路径越界检查和输出截断（20000 字符 / 500 行上限）；`find_definition` 支持 10+ 语言的定义正则匹配；`get_blast_radius` 利用代码图分析变更影响面（上游调用者/下游被调用者）
-- **src/core/code_graph/** — 代码图模块（影响面分析）：`parser.py` 多语言 AST/正则解析器（Python/JS/TS/Java/Go）；`store.py` SQLite 持久化存储 + FTS5 全文检索；`query.py` `CodeGraph` 高层查询 API（影响面 BFS 追溯）；`incremental.py` 基于 git diff 的增量更新（首次全量扫描，后续仅处理变更文件）
-- **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
+- **src/core/code_graph/** — 代码图模块（影响面分析）：`parser.py` 多语言 AST/正则解析器（Python/JS/TS/Java/Go）；`store.py` SQLite 持久化存储 + FTS5 全文检索；`query.py` `CodeGraph` 高层查询 API（影响面 BFS 追溯），`get_blast_radius` 全文件分析 + `get_blast_radius_for_nodes` 指定节点精确分析；`incremental.py` 基于 git diff 的增量更新（首次全量扫描，后续仅处理变更文件）
+- **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；`TokenUsage` dataclass（prompt/completion/cached tokens + `__iadd__`）、`ChatResult` dataclass（message + usage）；`chat()` 返回 `ChatResult` 支持逐次 token 统计；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
 - **src/core/gitlab_client.py** — httpx async 客户端，5 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`）
 - **src/core/repo_manager.py** — Git 仓库生命周期管理，oauth2 token 注入 clone URL
-- **src/core/privacy_filter.py** — 隐私过滤核心：`SanitizationMapping` 双向映射（original ↔ `<<TYPE_N>>` 占位符）、`PrivacyFilter` 3阶段过滤（`pre_scan` diff预扫描 → `scan_tool_results` 工具结果扫描 → `desanitize_text` 反脱敏）、规则引擎 + 本地LLM混合扫描
+- **src/core/privacy_filter.py** — 隐私过滤核心：`SanitizationMapping` 双向映射（original ↔ `<<TYPE_N>>` 占位符）、`PrivacyFilter` 3阶段过滤（`pre_scan` diff预扫描 → `scan_tool_results` 工具结果扫描 → `desanitize_text` 反脱敏）、规则引擎 + 本地LLM混合扫描、`token_usage` 属性跟踪本地模型 token 消耗
 - **src/core/privacy_rules.py** — 敏感数据检测规则库：7类规则（KEY/SECRET/IP/DOMAIN/EMAIL/CERT/CUSTOM）、3个检测等级（minimal仅密钥密码/standard+IP邮箱/strict+高熵字符串）
 - **src/core/dimensions.py** — 多维度审查定义：5个 `ReviewDimension`（bug 30%/security 25%/performance 15%/quality 15%/architecture 15%）、维度专属 System Prompt、加权评分算法（任一维度D或存在critical → 最终评级 ≤ C）
 - **src/core/context_manager.py** — 上下文长度管理：Token 字符估算、4阶段消息裁剪（工具结果截断2000字符 → 参数感知摘要替换 → 历史工具组移除 → Diff截断60%预算），保护 system+user 头部和尾部4条消息
@@ -97,7 +99,8 @@ PostgreSQL + SQLAlchemy 双引擎设计。两张表：`reviews`（审查记录�
 - FastAPI 使用异步引擎（`asyncpg`）
 - Celery Worker 使用同步引擎（`psycopg2`），通过 `DATABASE_URL_SYNC` property 自动转换
 - `review_comments` 表新增 `dimension` 字段（String(50), nullable），记录问题所属审查维度
-- Alembic 迁移: `alembic/versions/001_add_dimension_to_review_comments.py`
+- `reviews` 表新增 `total_prompt_tokens`、`total_completion_tokens`、`total_cached_tokens` 字段（Integer, default=0），持久化 token 统计
+- Alembic 迁移: `001_add_dimension_to_review_comments.py`、`002_add_token_columns_to_reviews.py`
 
 ### API Endpoints
 
@@ -227,6 +230,13 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | `CODE_GRAPH_ENABLED` | `true` | 启用代码图（影响面分析） |
 | `CODE_GRAPH_LANGUAGES` | `python,javascript,typescript,java,go` | 启用的语言列表 |
 | `CODE_GRAPH_MAX_FILES_FULL_SCAN` | `5000` | 全量扫描最大文件数，超过则跳过 |
+
+### 影响面预注入
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `BLAST_RADIUS_PRE_INJECT` | `true` | 审查开始前预注入影响面分析到 prompt |
+| `BLAST_RADIUS_MAX_ITEMS` | `30` | 预注入的最大符号数量 |
+| `BLAST_RADIUS_MAX_CHARS` | `4000` | 预注入文本的最大字符数（~1300 tokens） |
 
 ### 云端LLM
 | 配置项 | 默认值 | 说明 |

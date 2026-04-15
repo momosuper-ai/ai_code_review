@@ -97,6 +97,9 @@ async def get_review(
         "files_reviewed": review.files_reviewed,
         "issues_found": review.issues_found,
         "error_message": review.error_message,
+        "total_prompt_tokens": review.total_prompt_tokens,
+        "total_completion_tokens": review.total_completion_tokens,
+        "total_cached_tokens": review.total_cached_tokens,
         "created_at": review.created_at.isoformat() if review.created_at else None,
         "completed_at": review.completed_at.isoformat() if review.completed_at else None,
         "comments": [

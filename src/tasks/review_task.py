@@ -79,10 +79,17 @@ def run_review(
 
         # 维度统计日志
         for stat in result.get("dimension_stats", []):
+            dim_tokens = stat.get("prompt_tokens", 0) + stat.get("completion_tokens", 0)
+            token_detail = (
+                f" token={dim_tokens}(输入:{stat.get('prompt_tokens', 0)}"
+                f"/输出:{stat.get('completion_tokens', 0)}"
+                f"/缓存:{stat.get('cached_tokens', 0)})"
+            ) if dim_tokens > 0 else ""
             logger.info(
-                "[review:%d] 维度 %s: 评级=%s 问题数=%d 工具调用=%d 耗时=%.1fs %s",
+                "[review:%d] 维度 %s: 评级=%s 问题数=%d 工具调用=%d 耗时=%.1fs%s %s",
                 review_id, stat["display_name"], stat["score"],
                 stat["issues_count"], stat["tool_calls"], stat["duration"],
+                token_detail,
                 f"(失败: {stat['error']})" if not stat["success"] else "",
             )
 
@@ -104,12 +111,13 @@ def run_review(
         total_time = time.time() - task_start
         total_tokens = result.get("total_prompt_tokens", 0) + result.get("total_completion_tokens", 0)
         logger.info(
-            "[review:%d] 审查流程结束: 文件数=%d 问题数=%d 评级=%s 总耗时=%.1f秒 token用量=%d(输入:%d/输出:%d)",
+            "[review:%d] 审查流程结束: 文件数=%d 问题数=%d 评级=%s 总耗时=%.1f秒 token用量=%d(输入:%d/输出:%d/缓存:%d)",
             review_id, result["files_count"], len(result["issues"]),
             result["score"], total_time,
             total_tokens,
             result.get("total_prompt_tokens", 0),
             result.get("total_completion_tokens", 0),
+            result.get("total_cached_tokens", 0),
         )
 
     except Exception as exc:
@@ -206,6 +214,7 @@ async def _do_review_async(
         "comment_body": comment_body,
         "total_prompt_tokens": review_result.total_prompt_tokens,
         "total_completion_tokens": review_result.total_completion_tokens,
+        "total_cached_tokens": review_result.total_cached_tokens,
     }
 
 
@@ -239,6 +248,9 @@ def _save_review_result(review_id: int, result: dict) -> None:
         review_obj.summary = result["overall_assessment"]
         review_obj.files_reviewed = result["files_count"]
         review_obj.issues_found = len(result["issues"])
+        review_obj.total_prompt_tokens = result.get("total_prompt_tokens", 0)
+        review_obj.total_completion_tokens = result.get("total_completion_tokens", 0)
+        review_obj.total_cached_tokens = result.get("total_cached_tokens", 0)
         review_obj.completed_at = datetime.utcnow()
 
         for issue in result["issues"]:

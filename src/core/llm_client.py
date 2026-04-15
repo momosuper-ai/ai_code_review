@@ -3,12 +3,36 @@
 import asyncio
 import random
 import time
+from dataclasses import dataclass
 
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, BadRequestError, RateLimitError
 from openai.types.chat import ChatCompletionMessage
 
 from src.config import settings
 from src.utils.logger import logger
+
+
+@dataclass
+class TokenUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def __iadd__(self, other: "TokenUsage") -> "TokenUsage":
+        self.prompt_tokens += other.prompt_tokens
+        self.completion_tokens += other.completion_tokens
+        self.cached_tokens += other.cached_tokens
+        return self
+
+
+@dataclass
+class ChatResult:
+    message: ChatCompletionMessage
+    usage: TokenUsage
 
 
 class LLMClient:
@@ -21,6 +45,7 @@ class LLMClient:
         self._privacy_filter = None  # PrivacyFilter | None
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.total_cached_tokens = 0
 
     def set_privacy_filter(self, pf) -> None:
         """注入隐私过滤器，chat() 调用时自动脱敏。"""
@@ -44,7 +69,7 @@ class LLMClient:
         tools: list[dict] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 8192,
-    ) -> ChatCompletionMessage:
+    ) -> ChatResult:
         """Send a chat completion request, optionally with tools."""
         from src.core.context_manager import trim_messages
 
@@ -72,18 +97,27 @@ class LLMClient:
                 response = await self._client.chat.completions.create(**kwargs)
                 duration_ms = (time.time() - t0) * 1000
                 usage = response.usage
+                cached = 0
                 if usage:
                     self.total_prompt_tokens += usage.prompt_tokens
                     self.total_completion_tokens += usage.completion_tokens
+                    if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
+                        cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                    self.total_cached_tokens += cached
+                call_usage = TokenUsage(
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    completion_tokens=usage.completion_tokens if usage else 0,
+                    cached_tokens=cached,
+                )
                 logger.info(
                     "LLM 调用: 模型=%s 消息数=%d 工具=%s token用量=%s (%.0f毫秒)",
                     self._model,
                     len(messages),
                     "是" if tools else "否",
-                    f"{usage.prompt_tokens}+{usage.completion_tokens}" if usage else "无",
+                    f"{usage.prompt_tokens}+{usage.completion_tokens}(cached:{cached})" if usage else "无",
                     duration_ms,
                 )
-                return response.choices[0].message
+                return ChatResult(message=response.choices[0].message, usage=call_usage)
             except Exception as exc:
                 if attempt < max_retries and self._is_retryable(exc):
                     delay = min(

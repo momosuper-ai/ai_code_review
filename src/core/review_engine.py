@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 
 from src.core.agent_tools import AgentToolExecutor
-from src.core.llm_client import LLMClient
+from src.core.llm_client import ChatResult, LLMClient, TokenUsage
 from src.config import settings
 from src.utils.logger import logger
 
@@ -32,6 +32,34 @@ _SKIP_EXTENSIONS = {
     # Data
     ".sqlite", ".db",
 }
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+
+def _parse_changed_lines(diff_text: str) -> list[tuple[int, int]]:
+    """从 unified diff 中提取新文件侧的变更行范围列表。
+
+    返回 [(start, end), ...] 的 1-based 闭区间列表。
+    解析失败返回空列表。
+    """
+    ranges = []
+    for m in _HUNK_RE.finditer(diff_text):
+        start = int(m.group(1))
+        count = int(m.group(2)) if m.group(2) is not None else 1
+        if count == 0:
+            continue  # 纯删除 hunk，新文件无变更行
+        end = start + count - 1
+        ranges.append((start, end))
+    return ranges
+
+
+def _ranges_overlap(node_start: int, node_end: int, changed_ranges: list[tuple[int, int]]) -> bool:
+    """判断节点行范围是否与任一变更行范围重叠。"""
+    for ch_start, ch_end in changed_ranges:
+        if node_start <= ch_end and ch_start <= node_end:
+            return True
+    return False
+
 
 _SKIP_PATH_PREFIXES = [
     "vendor/", "node_modules/", "dist/", "build/", ".git/",
@@ -131,6 +159,13 @@ class ReviewResult:
     dimension_stats: list[dict] = field(default_factory=list)
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
+    total_cached_tokens: int = 0
+    # 分模型统计（双模型模式）
+    cloud_prompt_tokens: int = 0
+    cloud_completion_tokens: int = 0
+    cloud_cached_tokens: int = 0
+    local_prompt_tokens: int = 0
+    local_completion_tokens: int = 0
 
 
 @dataclass
@@ -146,6 +181,9 @@ class DimensionResult:
     success: bool = True
     error: str | None = None
     duration_seconds: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +196,12 @@ async def _parse_with_retry(
     messages: list[dict],
     tag: str = "",
     categories: list[str] | None = None,
-) -> ReviewResult:
-    """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。"""
+) -> tuple[ReviewResult, TokenUsage]:
+    """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。返回 (result, retry_usage)。"""
+    retry_usage = TokenUsage()
     result, error_type, error_detail = ReviewEngine._try_parse(content)
     if result is not None:
-        return result
+        return result, retry_usage
 
     from src.core.dimensions import build_format_retry_prompt
 
@@ -192,10 +231,11 @@ async def _parse_with_retry(
 
         temperature = _RETRY_TEMPERATURES[min(attempt - 1, len(_RETRY_TEMPERATURES) - 1)]
         try:
-            response = await llm.chat(
+            chat_result = await llm.chat(
                 retry_messages, tools=None, temperature=temperature,
             )
-            last_content = response.content or ""
+            last_content = chat_result.message.content or ""
+            retry_usage += chat_result.usage
         except Exception:
             logger.error(
                 "%s格式重试第 %d 次 LLM 调用异常", tag, attempt, exc_info=True,
@@ -205,10 +245,10 @@ async def _parse_with_retry(
         result, error_type, error_detail = ReviewEngine._try_parse(last_content)
         if result is not None:
             logger.info("%s格式重试成功 (第 %d 次尝试)", tag, attempt)
-            return result
+            return result, retry_usage
 
     logger.error("%s格式重试全部失败 (%d 次)，使用降级 fallback", tag, max_retries)
-    return ReviewEngine._fallback_result(last_content)
+    return ReviewEngine._fallback_result(last_content), retry_usage
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +278,7 @@ class DimensionAgent:
 
         start_time = time.time()
         tag = f"[review:{self.review_id}][{self.dimension.name}] " if self.review_id else f"[{self.dimension.name}] "
+        dim_usage = TokenUsage()
 
         system_prompt = build_dimension_prompt(self.dimension)
         messages: list[dict] = [
@@ -250,15 +291,18 @@ class DimensionAgent:
         for round_num in range(1, self.max_rounds + 1):
             logger.info("%sAgent 第 %d/%d 轮", tag, round_num, self.max_rounds)
 
-            response = await self.llm.chat(messages, tools=tool_defs)
+            chat_result = await self.llm.chat(messages, tools=tool_defs)
+            response = chat_result.message
+            dim_usage += chat_result.usage
 
             if not response.tool_calls:
                 content = response.content or ""
-                result = await _parse_with_retry(
+                result, retry_usage = await _parse_with_retry(
                     self.llm, content, messages, tag,
                     categories=self.dimension.categories,
                 )
-                return self._to_dimension_result(result, tool_calls_count, start_time)
+                dim_usage += retry_usage
+                return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
 
             # Process tool calls — 先解析参数，修复无效 JSON 后再追加到消息历史
             parsed_args_map: dict[str, dict] = {}
@@ -316,16 +360,19 @@ class DimensionAgent:
                 "role": "user",
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
-        response = await self.llm.chat(messages, tools=None)
-        content = response.content or ""
-        result = await _parse_with_retry(
+        chat_result = await self.llm.chat(messages, tools=None)
+        content = chat_result.message.content or ""
+        dim_usage += chat_result.usage
+        result, retry_usage = await _parse_with_retry(
             self.llm, content, messages, tag,
             categories=self.dimension.categories,
         )
-        return self._to_dimension_result(result, tool_calls_count, start_time)
+        dim_usage += retry_usage
+        return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
 
     def _to_dimension_result(
         self, review_result: ReviewResult, tool_calls_count: int, start_time: float,
+        usage: TokenUsage | None = None,
     ) -> DimensionResult:
         """将 ReviewResult 转为 DimensionResult，注入维度元数据。"""
         for issue in review_result.issues:
@@ -341,6 +388,9 @@ class DimensionAgent:
             highlights=review_result.highlights,
             tool_calls_count=tool_calls_count,
             duration_seconds=time.time() - start_time,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            cached_tokens=usage.cached_tokens if usage else 0,
         )
 
 
@@ -351,6 +401,7 @@ class DimensionAgent:
 class ReviewEngine:
     def __init__(self, repo_path: str, code_graph=None):
         self.repo_path = repo_path
+        self.code_graph = code_graph
         self.tools = AgentToolExecutor(repo_path, code_graph=code_graph)
         self.max_rounds = settings.AGENT_MAX_TOOL_ROUNDS
 
@@ -404,9 +455,12 @@ class ReviewEngine:
             filtered.append(change)
         return filtered
 
-    def _build_diff_prompt(self, changes: list[dict]) -> str:
+    def _build_diff_prompt(self, changes: list[dict], blast_radius_context: str = "") -> str:
         """Build user prompt containing the diffs."""
         parts = ["以下是本次代码变更的 diff 内容，请进行审查：\n"]
+        if blast_radius_context:
+            parts.append(blast_radius_context)
+            parts.append("")  # 空行分隔
         for change in changes:
             path = change.get("new_path") or change.get("old_path", "")
             diff = change.get("diff", "")
@@ -414,6 +468,86 @@ class ReviewEngine:
                 continue
             parts.append(f"### {path}\n```diff\n{diff}\n```\n")
         return "\n".join(parts)
+
+    def _build_blast_radius_context(self, changes: list[dict]) -> str:
+        """预计算变更文件的影响面，返回格式化文本。代码图不可用时返回空字符串。"""
+        if not settings.BLAST_RADIUS_PRE_INJECT:
+            return ""
+        if self.code_graph is None or not self.code_graph.available():
+            return ""
+
+        t0 = time.time()
+        all_results = []
+        total_symbols = 0
+
+        for change in changes:
+            path = change.get("new_path") or change.get("old_path", "")
+            if not path:
+                continue
+            normalized = path.lstrip("/").lstrip("\\").replace("\\", "/")
+            try:
+                # 解析 diff 变更行范围
+                diff_text = change.get("diff", "")
+                changed_ranges = _parse_changed_lines(diff_text) if diff_text else []
+
+                if changed_ranges:
+                    # 精确模式：只分析与变更行重叠的节点
+                    all_nodes = self.code_graph.store.find_nodes_by_path(normalized)
+                    affected_nodes = [
+                        n for n in all_nodes
+                        if _ranges_overlap(n.line_start, n.line_end, changed_ranges)
+                    ]
+                    if not affected_nodes:
+                        continue
+                    results = self.code_graph.get_blast_radius_for_nodes(
+                        normalized, affected_nodes, depth=2
+                    )
+                else:
+                    # Fallback：无法解析 diff 时分析整个文件
+                    results = self.code_graph.get_blast_radius(
+                        normalized, symbol=None, depth=2
+                    )
+            except Exception:
+                logger.debug("影响面预分析失败: %s", path, exc_info=True)
+                continue
+            for br in results:
+                if total_symbols >= settings.BLAST_RADIUS_MAX_ITEMS:
+                    break
+                all_results.append(br)
+                total_symbols += 1
+            if total_symbols >= settings.BLAST_RADIUS_MAX_ITEMS:
+                break
+
+        if not all_results:
+            return ""
+
+        parts = [
+            "## 变更影响面分析（自动预生成）\n",
+            "以下是本次变更文件中各符号的依赖关系概览，帮助你理解变更的影响范围：\n",
+        ]
+        for br in all_results:
+            lines = [f"- **{br.target}** (`{br.target_location}`)"]
+            if br.upstream_callers:
+                caller_strs = [f"`{c['name']}` ({c['location']})" for c in br.upstream_callers[:5]]
+                lines.append(f"  - 上游调用者: {', '.join(caller_strs)}")
+                if len(br.upstream_callers) > 5:
+                    lines.append(f"    (共 {len(br.upstream_callers)} 个调用者)")
+            if br.downstream_callees:
+                callee_strs = [f"`{c['name']}`" for c in br.downstream_callees[:5]]
+                lines.append(f"  - 下游依赖: {', '.join(callee_strs)}")
+                if len(br.downstream_callees) > 5:
+                    lines.append(f"    (共 {len(br.downstream_callees)} 个被调用)")
+            parts.append("\n".join(lines))
+
+        text = "\n".join(parts)
+        if len(text) > settings.BLAST_RADIUS_MAX_CHARS:
+            text = text[:settings.BLAST_RADIUS_MAX_CHARS] + "\n\n...(影响面信息已截断)"
+
+        logger.info(
+            "影响面预分析完成: %d 个符号, %.0f毫秒, %d 字符",
+            len(all_results), (time.time() - t0) * 1000, len(text),
+        )
+        return text
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -427,22 +561,32 @@ class ReviewEngine:
                 score="A",
             )
 
-        # Phase 1: Diff 隐私预扫描
+        # Phase 0: 预计算影响面
+        blast_radius_context = self._build_blast_radius_context(changes)
+
+        # Phase 1: Diff 隐私预扫描（包含影响面文本）
         if self.privacy_filter:
-            diff_text = self._build_diff_prompt(changes)
+            diff_text = self._build_diff_prompt(changes, blast_radius_context)
             await self.privacy_filter.pre_scan(diff_text)
 
         if settings.REVIEW_SINGLE_AGENT_MODE:
-            result = await self._run_single_agent(changes, review_id)
+            result = await self._run_single_agent(changes, review_id, blast_radius_context)
         else:
-            result = await self._run_multi_agent(changes, review_id)
+            result = await self._run_multi_agent(changes, review_id, blast_radius_context)
 
-        # Token 用量汇总
-        result.total_prompt_tokens = self.llm.total_prompt_tokens
-        result.total_completion_tokens = self.llm.total_completion_tokens
-        if self.local_llm:
-            result.total_prompt_tokens += self.local_llm.total_prompt_tokens
-            result.total_completion_tokens += self.local_llm.total_completion_tokens
+        # 云端模型 token（来自 result 内的维度累加）
+        result.cloud_prompt_tokens = result.total_prompt_tokens
+        result.cloud_completion_tokens = result.total_completion_tokens
+        result.cloud_cached_tokens = result.total_cached_tokens
+
+        # 本地模型 token（隐私扫描）
+        if self.privacy_filter:
+            local_usage = self.privacy_filter.token_usage
+            result.local_prompt_tokens = local_usage.prompt_tokens
+            result.local_completion_tokens = local_usage.completion_tokens
+            result.total_prompt_tokens += local_usage.prompt_tokens
+            result.total_completion_tokens += local_usage.completion_tokens
+            result.total_cached_tokens += local_usage.cached_tokens
 
         # Phase 3: 结果反脱敏
         if self.privacy_filter:
@@ -479,11 +623,12 @@ class ReviewEngine:
     # Single-agent mode (original logic)
     # ------------------------------------------------------------------
 
-    async def _run_single_agent(self, changes: list[dict], review_id: int | None = None) -> ReviewResult:
+    async def _run_single_agent(self, changes: list[dict], review_id: int | None = None, blast_radius_context: str = "") -> ReviewResult:
         """原有单Agent逻辑，完整保留现有 run_review 行为。"""
         tag = f"[review:{review_id}] " if review_id else ""
+        agent_usage = TokenUsage()
 
-        user_prompt = self._build_diff_prompt(changes)
+        user_prompt = self._build_diff_prompt(changes, blast_radius_context)
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -494,12 +639,18 @@ class ReviewEngine:
         for round_num in range(self.max_rounds):
             logger.info("%sAgent 第 %d/%d 轮", tag, round_num + 1, self.max_rounds)
 
-            response = await self.llm.chat(messages, tools=tool_defs)
+            chat_result = await self.llm.chat(messages, tools=tool_defs)
+            response = chat_result.message
+            agent_usage += chat_result.usage
 
             if not response.tool_calls:
                 content = response.content or ""
-                result = await self._parse_with_retry(content, messages, tag)
+                result, retry_usage = await self._parse_with_retry(content, messages, tag)
+                agent_usage += retry_usage
                 result.tool_calls_count = total_tool_calls
+                result.total_prompt_tokens = agent_usage.prompt_tokens
+                result.total_completion_tokens = agent_usage.completion_tokens
+                result.total_cached_tokens = agent_usage.cached_tokens
                 logger.info(
                     "%s结果解析成功: 评级=%s 问题数=%d",
                     tag, result.score, len(result.issues),
@@ -562,22 +713,27 @@ class ReviewEngine:
                 "role": "user",
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
-        response = await self.llm.chat(messages, tools=None)
-        content = response.content or ""
-        result = await self._parse_with_retry(content, messages, tag)
+        chat_result = await self.llm.chat(messages, tools=None)
+        content = chat_result.message.content or ""
+        agent_usage += chat_result.usage
+        result, retry_usage = await self._parse_with_retry(content, messages, tag)
+        agent_usage += retry_usage
         result.tool_calls_count = total_tool_calls
+        result.total_prompt_tokens = agent_usage.prompt_tokens
+        result.total_completion_tokens = agent_usage.completion_tokens
+        result.total_cached_tokens = agent_usage.cached_tokens
         return result
 
     # ------------------------------------------------------------------
     # Multi-agent mode
     # ------------------------------------------------------------------
 
-    async def _run_multi_agent(self, changes: list[dict], review_id: int | None = None) -> ReviewResult:
+    async def _run_multi_agent(self, changes: list[dict], review_id: int | None = None, blast_radius_context: str = "") -> ReviewResult:
         """多Agent并行审查。"""
         from src.core.dimensions import get_enabled_dimensions
 
         dimensions = get_enabled_dimensions()
-        diff_prompt = self._build_diff_prompt(changes)
+        diff_prompt = self._build_diff_prompt(changes, blast_radius_context)
         tag = f"[review:{review_id}] " if review_id else ""
 
         logger.info("%s启动多维度并行审查: %d 个维度", tag, len(dimensions))
@@ -653,6 +809,9 @@ class ReviewEngine:
         total_tool_calls = sum(r.tool_calls_count for r in dim_results)
 
         dimension_stats = []
+        total_prompt = 0
+        total_completion = 0
+        total_cached = 0
         for r in dim_results:
             dimension_stats.append({
                 "name": r.dimension_name,
@@ -665,7 +824,13 @@ class ReviewEngine:
                 "success": r.success,
                 "error": r.error,
                 "assessment": r.overall_assessment if r.success else "",
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "cached_tokens": r.cached_tokens,
             })
+            total_prompt += r.prompt_tokens
+            total_completion += r.completion_tokens
+            total_cached += r.cached_tokens
 
         return ReviewResult(
             overall_assessment=overall,
@@ -674,6 +839,9 @@ class ReviewEngine:
             highlights=all_highlights,
             tool_calls_count=total_tool_calls,
             dimension_stats=dimension_stats,
+            total_prompt_tokens=total_prompt,
+            total_completion_tokens=total_completion,
+            total_cached_tokens=total_cached,
         )
 
     @staticmethod
@@ -823,7 +991,7 @@ class ReviewEngine:
         content: str,
         messages: list[dict],
         tag: str = "",
-    ) -> ReviewResult:
+    ) -> tuple[ReviewResult, TokenUsage]:
         """实例方法代理，保持单Agent模式的兼容。"""
         return await _parse_with_retry(self.llm, content, messages, tag)
 

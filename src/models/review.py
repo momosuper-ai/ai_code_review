@@ -45,6 +45,9 @@ class Review(Base):
     files_reviewed: Mapped[int] = mapped_column(Integer, default=0)
     issues_found: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

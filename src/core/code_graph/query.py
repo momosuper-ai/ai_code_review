@@ -101,6 +101,35 @@ class CodeGraph:
             ))
         return results
 
+    def get_blast_radius_for_nodes(
+        self,
+        file_path: str,
+        nodes: list[NodeRow],
+        depth: int = 2,
+    ) -> list[BlastRadius]:
+        """对指定节点列表计算影响面（跳过 find_nodes_by_path 全量查询）。"""
+        depth = max(1, depth)
+        if not nodes:
+            return []
+
+        sibling_map = {n.id: [self._node_to_dict(s) for s in nodes if s.id != n.id]
+                       for n in nodes}
+
+        results: list[BlastRadius] = []
+        for node in nodes:
+            if node.kind not in ("function", "method", "class"):
+                continue
+            upstream = self._walk_upstream(node.name, depth)
+            downstream = self._walk_downstream(node.id, depth)
+            results.append(BlastRadius(
+                target=f"{node.kind} {node.name}",
+                target_location=f"{node.path}:{node.line_start}",
+                upstream_callers=upstream,
+                downstream_callees=downstream,
+                siblings=sibling_map.get(node.id, [])[:5],
+            ))
+        return results
+
     def _walk_upstream(self, name: str, depth: int) -> list[dict]:
         """BFS 向上追溯：所有（传递地）调用了 ``name`` 的节点。"""
         seen: set[int] = set()

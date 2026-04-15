@@ -73,8 +73,11 @@ class PrivacyFilter:
     """隐私过滤器：规则引擎 + 可选本地模型扫描。"""
 
     def __init__(self, local_llm=None):
+        from src.core.llm_client import TokenUsage
+
         self._mapping = SanitizationMapping()
         self._local_llm = local_llm
+        self.token_usage = TokenUsage()
         self._rules: list[SensitivePattern] = get_rules_for_level(
             settings.PRIVACY_FILTER_LEVEL
         )
@@ -319,11 +322,12 @@ class PrivacyFilter:
 
         try:
             t0 = time.time()
-            response = await self._local_llm.chat(
+            chat_result = await self._local_llm.chat(
                 messages, tools=None, temperature=0.0, max_tokens=2048,
             )
             duration_ms = (time.time() - t0) * 1000
-            content = response.content or ""
+            content = chat_result.message.content or ""
+            self.token_usage += chat_result.usage
             logger.debug("本地模型隐私扫描完成 (%.0f毫秒)", duration_ms)
         except Exception as exc:
             logger.warning("本地模型隐私扫描调用失败: %s", exc)

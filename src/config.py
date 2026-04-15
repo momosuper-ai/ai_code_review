@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     CODE_GRAPH_LANGUAGES: str = "python,javascript,typescript,java,go"
     CODE_GRAPH_MAX_FILES_FULL_SCAN: int = 5000
 
+    # 影响面预注入
+    BLAST_RADIUS_PRE_INJECT: bool = True    # 审查开始前预注入影响面分析到 prompt
+    BLAST_RADIUS_MAX_ITEMS: int = 30        # 预注入的最大符号数量
+    BLAST_RADIUS_MAX_CHARS: int = 4000      # 预注入文本的最大字符数（~1300 tokens）
+
     # SonarQube（预留）
     SONARQUBE_URL: str = ""
     SONARQUBE_TOKEN: str = ""

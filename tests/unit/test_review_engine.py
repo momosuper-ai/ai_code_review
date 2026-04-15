@@ -5,12 +5,32 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.core.llm_client import ChatResult, TokenUsage
 from src.core.review_engine import (
     DimensionResult,
     ReviewEngine,
     ReviewResult,
+    _parse_changed_lines,
     _parse_with_retry,
+    _ranges_overlap,
 )
+
+
+def _make_chat_result(content: str = "", tool_calls=None,
+                       prompt_tokens: int = 100, completion_tokens: int = 50,
+                       cached_tokens: int = 0) -> ChatResult:
+    """Helper to create a ChatResult with a mock message."""
+    msg = MagicMock()
+    msg.content = content
+    msg.tool_calls = tool_calls
+    return ChatResult(
+        message=msg,
+        usage=TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +151,9 @@ class TestParseWithRetry:
             "issues": [],
             "highlights": [],
         })
-        result = await _parse_with_retry(mock_llm, valid_json, [], tag="[test] ")
+        result, usage = await _parse_with_retry(mock_llm, valid_json, [], tag="[test] ")
         assert result.score == "A"
+        assert usage.total_tokens == 0
         mock_llm.chat.assert_not_called()
 
     @pytest.mark.asyncio
@@ -144,7 +165,7 @@ class TestParseWithRetry:
             "issues": [],
             "highlights": [],
         })
-        result = await engine._parse_with_retry(valid_json, [], tag="[test] ")
+        result, usage = await engine._parse_with_retry(valid_json, [], tag="[test] ")
         assert result.score == "A"
         engine.llm.chat.assert_not_called()
 
@@ -158,29 +179,28 @@ class TestParseWithRetry:
             "highlights": [],
         })
 
-        mock_response = MagicMock()
-        mock_response.content = good_json
-        mock_llm.chat = AsyncMock(return_value=mock_response)
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content=good_json))
 
-        result = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
+        result, usage = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
         assert result.score == "B"
         assert result.overall_assessment == "Fixed"
         assert mock_llm.chat.call_count == 1
+        assert usage.prompt_tokens == 100
+        assert usage.completion_tokens == 50
 
     @pytest.mark.asyncio
     async def test_all_retries_fail_uses_fallback(self, mock_llm):
         bad_content = "still no json"
 
-        mock_response = MagicMock()
-        mock_response.content = "also no json"
-        mock_llm.chat = AsyncMock(return_value=mock_response)
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content="also no json"))
 
         with patch("src.core.review_engine.settings") as mock_settings:
             mock_settings.AGENT_FORMAT_RETRY_MAX = 2
-            result = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
+            result, usage = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
 
         assert "审查结果格式解析失败" in result.overall_assessment
         assert mock_llm.chat.call_count == 2
+        assert usage.prompt_tokens == 200  # 2 retries × 100
 
     @pytest.mark.asyncio
     async def test_llm_exception_does_not_break_retry(self, mock_llm):
@@ -192,15 +212,13 @@ class TestParseWithRetry:
             "highlights": [],
         })
 
-        mock_good = MagicMock()
-        mock_good.content = good_json
         mock_llm.chat = AsyncMock(
-            side_effect=[Exception("LLM down"), mock_good],
+            side_effect=[Exception("LLM down"), _make_chat_result(content=good_json)],
         )
 
         with patch("src.core.review_engine.settings") as mock_settings:
             mock_settings.AGENT_FORMAT_RETRY_MAX = 3
-            result = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
+            result, usage = await _parse_with_retry(mock_llm, bad_content, [], tag="[test] ")
 
         assert result.score == "A"
         assert result.overall_assessment == "Recovered"
@@ -209,9 +227,7 @@ class TestParseWithRetry:
     async def test_temperature_decreases(self, mock_llm):
         bad_content = "no json"
 
-        mock_response = MagicMock()
-        mock_response.content = "still bad"
-        mock_llm.chat = AsyncMock(return_value=mock_response)
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content="still bad"))
 
         with patch("src.core.review_engine.settings") as mock_settings:
             mock_settings.AGENT_FORMAT_RETRY_MAX = 3
@@ -226,14 +242,13 @@ class TestParseWithRetry:
         original_messages = [{"role": "user", "content": "test"}]
         original_len = len(original_messages)
 
-        mock_response = MagicMock()
-        mock_response.content = json.dumps({
+        good_json = json.dumps({
             "overall_assessment": "ok",
             "score": "B",
             "issues": [],
             "highlights": [],
         })
-        mock_llm.chat = AsyncMock(return_value=mock_response)
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content=good_json))
 
         await _parse_with_retry(mock_llm, bad_content, original_messages, tag="")
         assert len(original_messages) == original_len
@@ -248,11 +263,9 @@ class TestParseWithRetry:
             "issues": [],
             "highlights": [],
         })
-        mock_response = MagicMock()
-        mock_response.content = good_json
-        mock_llm.chat = AsyncMock(return_value=mock_response)
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content=good_json))
 
-        result = await _parse_with_retry(
+        result, _ = await _parse_with_retry(
             mock_llm, bad_content, [], tag="",
             categories=["bug"],
         )
@@ -590,3 +603,382 @@ class TestFormatGitlabCommentMultiDimension:
         comment = ReviewEngine.format_gitlab_comment(result, 5)
         # Should not have a "### 🔍 缺陷分析 (评级:" section since no issues
         assert "(评级:" not in comment
+
+
+# ---------------------------------------------------------------------------
+# _parse_changed_lines
+# ---------------------------------------------------------------------------
+class TestParseChangedLines:
+    def test_parse_single_hunk(self):
+        diff = "@@ -1,3 +1,4 @@\n+new line\n context\n"
+        assert _parse_changed_lines(diff) == [(1, 4)]
+
+    def test_parse_multiple_hunks(self):
+        diff = "@@ -1,3 +1,4 @@\n+line\n@@ -20,5 +21,3 @@\n-removed\n"
+        assert _parse_changed_lines(diff) == [(1, 4), (21, 23)]
+
+    def test_parse_count_omitted(self):
+        diff = "@@ -1 +1 @@\n+single\n"
+        assert _parse_changed_lines(diff) == [(1, 1)]
+
+    def test_parse_pure_delete(self):
+        diff = "@@ -5,3 +5,0 @@\n-deleted\n"
+        assert _parse_changed_lines(diff) == []
+
+    def test_parse_empty_diff(self):
+        assert _parse_changed_lines("") == []
+
+    def test_parse_no_hunks(self):
+        assert _parse_changed_lines("just some text without hunk headers") == []
+
+    def test_parse_real_world_diff(self):
+        diff = (
+            "--- a/src/core/engine.py\n"
+            "+++ b/src/core/engine.py\n"
+            "@@ -10,6 +10,8 @@ class Engine:\n"
+            "     def __init__(self):\n"
+            "+        self.x = 1\n"
+            "+        self.y = 2\n"
+            "         pass\n"
+            "@@ -50,4 +52,5 @@ class Engine:\n"
+            "     def run(self):\n"
+            "+        return True\n"
+            "         pass\n"
+        )
+        assert _parse_changed_lines(diff) == [(10, 17), (52, 56)]
+
+
+# ---------------------------------------------------------------------------
+# _ranges_overlap
+# ---------------------------------------------------------------------------
+class TestRangesOverlap:
+    def test_overlap_exact(self):
+        assert _ranges_overlap(5, 10, [(5, 10)]) is True
+
+    def test_overlap_partial(self):
+        assert _ranges_overlap(5, 10, [(8, 15)]) is True
+
+    def test_no_overlap(self):
+        assert _ranges_overlap(5, 10, [(11, 20)]) is False
+
+    def test_node_contains_range(self):
+        assert _ranges_overlap(1, 100, [(50, 60)]) is True
+
+    def test_range_contains_node(self):
+        assert _ranges_overlap(50, 60, [(1, 100)]) is True
+
+    def test_adjacent_no_overlap(self):
+        assert _ranges_overlap(5, 10, [(11, 15)]) is False
+
+    def test_multiple_ranges_one_overlaps(self):
+        assert _ranges_overlap(50, 60, [(1, 10), (55, 65)]) is True
+
+    def test_empty_ranges(self):
+        assert _ranges_overlap(5, 10, []) is False
+
+
+# ---------------------------------------------------------------------------
+# _build_blast_radius_context
+# ---------------------------------------------------------------------------
+class TestBuildBlastRadiusContext:
+    @pytest.fixture
+    def engine(self):
+        with patch("src.core.review_engine.LLMClient"):
+            with patch("src.core.review_engine.AgentToolExecutor"):
+                return ReviewEngine("/fake/repo")
+
+    @pytest.fixture
+    def changes(self):
+        return [
+            {"new_path": "src/core/payment.py", "diff": "+code"},
+            {"new_path": "src/api/orders.py", "diff": "+more"},
+        ]
+
+    def _make_blast_radius(self, target, location, callers=None, callees=None):
+        from src.core.code_graph.query import BlastRadius
+        return BlastRadius(
+            target=target,
+            target_location=location,
+            upstream_callers=callers or [],
+            downstream_callees=callees or [],
+        )
+
+    def test_returns_empty_when_disabled(self, engine, changes):
+        """配置关闭时返回空字符串。"""
+        engine.code_graph = MagicMock()
+        with patch("src.core.review_engine.settings") as mock_settings:
+            mock_settings.BLAST_RADIUS_PRE_INJECT = False
+            result = engine._build_blast_radius_context(changes)
+        assert result == ""
+
+    def test_returns_empty_when_no_graph(self, engine, changes):
+        """code_graph=None 时返回空。"""
+        engine.code_graph = None
+        result = engine._build_blast_radius_context(changes)
+        assert result == ""
+
+    def test_returns_empty_when_graph_unavailable(self, engine, changes):
+        """代码图为空时返回空。"""
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = False
+        engine.code_graph = mock_graph
+        result = engine._build_blast_radius_context(changes)
+        assert result == ""
+
+    def test_formats_blast_radius(self, engine, changes):
+        """正常格式化，包含上下游信息。"""
+        br = self._make_blast_radius(
+            "function process_payment",
+            "src/core/payment.py:42",
+            callers=[{"name": "handle_order", "location": "src/api/orders.py:88"}],
+            callees=[{"name": "validate_card"}, {"name": "send_to_gateway"}],
+        )
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.return_value = [br]
+        engine.code_graph = mock_graph
+
+        result = engine._build_blast_radius_context(changes)
+        assert "变更影响面分析" in result
+        assert "process_payment" in result
+        assert "handle_order" in result
+        assert "validate_card" in result
+
+    def test_truncates_at_max_chars(self, engine, changes):
+        """超长文本被截断。"""
+        br = self._make_blast_radius(
+            "function long_name_" + "x" * 200,
+            "src/core/payment.py:1",
+            callers=[{"name": f"caller_{i}", "location": f"file.py:{i}"} for i in range(10)],
+        )
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.return_value = [br]
+        engine.code_graph = mock_graph
+
+        with patch("src.core.review_engine.settings") as mock_settings:
+            mock_settings.BLAST_RADIUS_PRE_INJECT = True
+            mock_settings.BLAST_RADIUS_MAX_ITEMS = 30
+            mock_settings.BLAST_RADIUS_MAX_CHARS = 100  # 极小值强制截断
+            result = engine._build_blast_radius_context(changes)
+
+        assert "影响面信息已截断" in result
+        # 截断前文本 + 截断后缀不超过 MAX_CHARS + 后缀长度
+        assert len(result) < 200
+
+    def test_max_items_limit(self, engine):
+        """符号数量上限生效。"""
+        changes = [{"new_path": f"file_{i}.py", "diff": "+x"} for i in range(10)]
+        brs = [
+            self._make_blast_radius(f"function func_{i}", f"file_{i}.py:{i}")
+            for i in range(5)
+        ]
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.return_value = brs
+        engine.code_graph = mock_graph
+
+        with patch("src.core.review_engine.settings") as mock_settings:
+            mock_settings.BLAST_RADIUS_PRE_INJECT = True
+            mock_settings.BLAST_RADIUS_MAX_ITEMS = 3
+            mock_settings.BLAST_RADIUS_MAX_CHARS = 10000
+            result = engine._build_blast_radius_context(changes)
+
+        # 最多 3 个符号，第一个文件返回 5 个但只取前 3 个
+        assert result.count("**function func_") == 3
+
+    def test_exception_per_file_non_blocking(self, engine, changes):
+        """单文件异常不阻塞其他。"""
+        br = self._make_blast_radius("function ok_func", "src/api/orders.py:1")
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.side_effect = [
+            RuntimeError("parse error"),  # 第一个文件失败
+            [br],                         # 第二个文件成功
+        ]
+        engine.code_graph = mock_graph
+
+        result = engine._build_blast_radius_context(changes)
+        assert "ok_func" in result
+
+    def test_blast_radius_before_diffs(self, engine, changes):
+        """影响面文本出现在 diff 之前。"""
+        br = self._make_blast_radius(
+            "function process_payment", "src/core/payment.py:42",
+        )
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.return_value = [br]
+        engine.code_graph = mock_graph
+
+        blast_ctx = engine._build_blast_radius_context(changes)
+        prompt = engine._build_diff_prompt(changes, blast_ctx)
+
+        blast_pos = prompt.index("变更影响面分析")
+        diff_pos = prompt.index("```diff")
+        assert blast_pos < diff_pos
+
+    def test_only_affected_symbols(self, engine):
+        """验证仅分析与 diff 行重叠的符号。"""
+        from src.core.code_graph.store import NodeRow
+        diff_with_hunks = "@@ -10,3 +10,5 @@\n+new line\n context\n"
+        changes = [{"new_path": "src/app.py", "diff": diff_with_hunks}]
+
+        # 3 个节点：只有 func_b (行 8-15) 与变更范围 (10-14) 重叠
+        node_a = NodeRow(id=1, path="src/app.py", kind="function", name="func_a",
+                         line_start=1, line_end=5, signature="def func_a()")
+        node_b = NodeRow(id=2, path="src/app.py", kind="function", name="func_b",
+                         line_start=8, line_end=15, signature="def func_b()")
+        node_c = NodeRow(id=3, path="src/app.py", kind="function", name="func_c",
+                         line_start=20, line_end=30, signature="def func_c()")
+
+        br_b = self._make_blast_radius("function func_b", "src/app.py:8")
+
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.store.find_nodes_by_path.return_value = [node_a, node_b, node_c]
+        mock_graph.get_blast_radius_for_nodes.return_value = [br_b]
+        engine.code_graph = mock_graph
+
+        result = engine._build_blast_radius_context(changes)
+
+        # 应该调用 get_blast_radius_for_nodes 而非 get_blast_radius
+        mock_graph.get_blast_radius_for_nodes.assert_called_once()
+        mock_graph.get_blast_radius.assert_not_called()
+
+        # 传入的 affected_nodes 应该只有 node_b
+        call_args = mock_graph.get_blast_radius_for_nodes.call_args
+        affected_nodes = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["nodes"]
+        assert len(affected_nodes) == 1
+        assert affected_nodes[0].name == "func_b"
+
+        assert "func_b" in result
+
+    def test_fallback_when_no_hunks(self, engine):
+        """diff 无 hunk header 时 fallback 到全文件分析。"""
+        changes = [{"new_path": "src/app.py", "diff": "+just added text"}]
+
+        br = self._make_blast_radius("function fallback_func", "src/app.py:1")
+        mock_graph = MagicMock()
+        mock_graph.available.return_value = True
+        mock_graph.get_blast_radius.return_value = [br]
+        engine.code_graph = mock_graph
+
+        result = engine._build_blast_radius_context(changes)
+
+        # 应该调用 get_blast_radius（fallback）
+        mock_graph.get_blast_radius.assert_called_once()
+        mock_graph.get_blast_radius_for_nodes.assert_not_called()
+        assert "fallback_func" in result
+
+
+# ---------------------------------------------------------------------------
+# Token usage tracking
+# ---------------------------------------------------------------------------
+class TestTokenUsage:
+    def test_token_usage_iadd(self):
+        """TokenUsage += operator works correctly."""
+        a = TokenUsage(prompt_tokens=100, completion_tokens=50, cached_tokens=20)
+        b = TokenUsage(prompt_tokens=200, completion_tokens=100, cached_tokens=40)
+        a += b
+        assert a.prompt_tokens == 300
+        assert a.completion_tokens == 150
+        assert a.cached_tokens == 60
+        assert a.total_tokens == 450
+
+    def test_token_usage_total(self):
+        u = TokenUsage(prompt_tokens=100, completion_tokens=50, cached_tokens=30)
+        assert u.total_tokens == 150
+
+    def test_cached_tokens_extraction(self):
+        """ChatResult correctly extracts cached_tokens from API response."""
+        cr = _make_chat_result(
+            content="test", prompt_tokens=500, completion_tokens=200, cached_tokens=150,
+        )
+        assert cr.usage.cached_tokens == 150
+        assert cr.usage.prompt_tokens == 500
+        assert cr.usage.total_tokens == 700
+
+    @pytest.mark.asyncio
+    async def test_parse_with_retry_accumulates_tokens(self):
+        """_parse_with_retry accumulates tokens across retries."""
+        mock_llm = MagicMock()
+        bad_content = "no json"
+        good_json = json.dumps({
+            "overall_assessment": "ok", "score": "B", "issues": [], "highlights": [],
+        })
+
+        mock_llm.chat = AsyncMock(side_effect=[
+            _make_chat_result(content="still bad", prompt_tokens=100, completion_tokens=50, cached_tokens=10),
+            _make_chat_result(content=good_json, prompt_tokens=120, completion_tokens=60, cached_tokens=15),
+        ])
+
+        with patch("src.core.review_engine.settings") as mock_settings:
+            mock_settings.AGENT_FORMAT_RETRY_MAX = 3
+            result, usage = await _parse_with_retry(mock_llm, bad_content, [], tag="")
+
+        assert result.score == "B"
+        assert usage.prompt_tokens == 220
+        assert usage.completion_tokens == 110
+        assert usage.cached_tokens == 25
+
+    def test_dimension_result_has_token_fields(self):
+        """DimensionResult includes token tracking fields."""
+        dr = DimensionResult(
+            dimension_name="bug",
+            prompt_tokens=500,
+            completion_tokens=200,
+            cached_tokens=100,
+        )
+        assert dr.prompt_tokens == 500
+        assert dr.completion_tokens == 200
+        assert dr.cached_tokens == 100
+
+    def test_merge_results_aggregates_tokens(self):
+        """_merge_results sums token usage across dimensions."""
+        with patch("src.core.review_engine.LLMClient"):
+            with patch("src.core.review_engine.AgentToolExecutor"):
+                engine = ReviewEngine("/fake/repo")
+
+        dim_results = [
+            DimensionResult(
+                dimension_name="bug", display_name="缺陷分析", icon="🔍",
+                score="A", issues=[], highlights=["good"],
+                success=True, tool_calls_count=3, duration_seconds=5.0,
+                prompt_tokens=1000, completion_tokens=500, cached_tokens=200,
+            ),
+            DimensionResult(
+                dimension_name="security", display_name="安全审查", icon="🛡️",
+                score="B", issues=[{
+                    "file_path": "x.py", "severity": "major",
+                    "category": "security", "content": "问题",
+                    "dimension": "security",
+                }],
+                highlights=[], success=True, tool_calls_count=2, duration_seconds=4.0,
+                prompt_tokens=800, completion_tokens=400, cached_tokens=150,
+            ),
+        ]
+        result = engine._merge_results(dim_results)
+        assert result.total_prompt_tokens == 1800
+        assert result.total_completion_tokens == 900
+        assert result.total_cached_tokens == 350
+        # Check dimension stats contain token info
+        for stat in result.dimension_stats:
+            assert "prompt_tokens" in stat
+            assert "completion_tokens" in stat
+            assert "cached_tokens" in stat
+
+    def test_review_result_has_model_token_fields(self):
+        """ReviewResult includes cloud/local model token fields."""
+        result = ReviewResult(
+            total_prompt_tokens=2000,
+            total_completion_tokens=800,
+            total_cached_tokens=400,
+            cloud_prompt_tokens=1500,
+            cloud_completion_tokens=600,
+            cloud_cached_tokens=300,
+            local_prompt_tokens=500,
+            local_completion_tokens=200,
+        )
+        assert result.cloud_prompt_tokens == 1500
+        assert result.local_prompt_tokens == 500
