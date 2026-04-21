@@ -75,24 +75,14 @@ class TestHandlePush:
         assert result["status"] == "ignored"
         assert "no commits" in result["reason"]
 
+    def test_ai_readme_temp_branch_ignored(self):
+        """防递归：push 到 ai-readme/ 前缀分支的事件直接 ignored。"""
+        result = _handle_push(_push_payload(branch="ai-readme/1234-abc12345"))
+        assert result["status"] == "ignored"
+        assert result["reason"] == "ai_readme_temp_branch"
+
 
 class TestHandleMR:
-    @patch("src.tasks.review_task.run_review")
-    def test_open_accepted_with_source_branch(self, mock_task):
-        mock_task.delay.return_value = MagicMock(id="task-3")
-        result = _handle_mr(_mr_payload(action="open"))
-        assert result["status"] == "accepted"
-        call_kwargs = mock_task.delay.call_args[1]
-        assert call_kwargs["branch"] == "feature/bar"
-
-    @patch("src.tasks.review_task.run_review")
-    def test_update_accepted_with_source_branch(self, mock_task):
-        mock_task.delay.return_value = MagicMock(id="task-4")
-        result = _handle_mr(_mr_payload(action="update"))
-        assert result["status"] == "accepted"
-        call_kwargs = mock_task.delay.call_args[1]
-        assert call_kwargs["branch"] == "feature/bar"
-
     @patch("src.tasks.review_task.run_review")
     def test_merge_accepted_with_target_branch(self, mock_task):
         mock_task.delay.return_value = MagicMock(id="task-5")
@@ -100,12 +90,23 @@ class TestHandleMR:
         assert result["status"] == "accepted"
         call_kwargs = mock_task.delay.call_args[1]
         assert call_kwargs["branch"] == "main"
+        assert call_kwargs["mr_action"] == "merge"
 
-    @patch("src.tasks.review_task.run_review")
-    def test_reopen_accepted(self, mock_task):
-        mock_task.delay.return_value = MagicMock(id="task-6")
+    def test_open_ignored(self):
+        """MR open 不再触发审查（新规则：仅 merge 触发）。"""
+        result = _handle_mr(_mr_payload(action="open"))
+        assert result["status"] == "ignored"
+        assert "not reviewable" in result["reason"]
+
+    def test_update_ignored(self):
+        result = _handle_mr(_mr_payload(action="update"))
+        assert result["status"] == "ignored"
+        assert "not reviewable" in result["reason"]
+
+    def test_reopen_ignored(self):
         result = _handle_mr(_mr_payload(action="reopen"))
-        assert result["status"] == "accepted"
+        assert result["status"] == "ignored"
+        assert "not reviewable" in result["reason"]
 
     def test_close_ignored(self):
         result = _handle_mr(_mr_payload(action="close"))
@@ -113,6 +114,54 @@ class TestHandleMR:
         assert "not reviewable" in result["reason"]
 
     def test_target_not_main_branch_ignored(self):
-        result = _handle_mr(_mr_payload(action="open", target_branch="develop"))
+        result = _handle_mr(_mr_payload(action="merge", target_branch="develop"))
         assert result["status"] == "ignored"
         assert "target_branch" in result["reason"]
+
+    def test_ai_readme_source_branch_ignored(self):
+        """防递归：source_branch 以 ai-readme/ 开头的 MR 直接 ignored。"""
+        payload = _mr_payload(action="merge", source_branch="ai-readme/1234-abc12345")
+        result = _handle_mr(payload)
+        assert result["status"] == "ignored"
+        assert result["reason"] == "ai_readme_mr"
+
+    def test_ai_readme_title_ignored(self):
+        """防递归：title 以 [AI-README] 开头的 MR 直接 ignored。"""
+        payload = _mr_payload(action="merge")
+        payload["object_attributes"]["title"] = "[AI-README] 更新 AI_README"
+        result = _handle_mr(payload)
+        assert result["status"] == "ignored"
+        assert result["reason"] == "ai_readme_mr"
+
+
+class TestMergePushSuppression:
+    """MR merge 同步发送的 push 事件应被抑制，避免重复审查。"""
+
+    @patch("src.api.v1.webhooks._mark_mr_merge")
+    @patch("src.tasks.review_task.run_review")
+    def test_mr_merge_writes_suppress_mark(self, mock_task, mock_mark):
+        mock_task.delay.return_value = MagicMock(id="task-m1")
+        _handle_mr(_mr_payload(action="merge"))
+        mock_mark.assert_called_once()
+        args = mock_mark.call_args[0]
+        assert args[0] == 1  # project_id
+        assert args[1] == "c" * 40  # commit_sha
+
+    @patch("src.api.v1.webhooks._mark_mr_merge")
+    def test_mr_non_merge_does_not_write_mark(self, mock_mark):
+        """非 merge action 已在入口 ignored，不会写入 Redis 标记。"""
+        _handle_mr(_mr_payload(action="update"))
+        mock_mark.assert_not_called()
+
+    @patch("src.api.v1.webhooks._is_mr_merge_dispatched", return_value=True)
+    def test_push_suppressed_when_mark_present(self, _mock_check):
+        result = _handle_push(_push_payload(branch="main"))
+        assert result["status"] == "ignored"
+        assert "suppressed by MR merge event" in result["reason"]
+
+    @patch("src.api.v1.webhooks._is_mr_merge_dispatched", return_value=False)
+    @patch("src.tasks.review_task.run_review")
+    def test_push_processed_when_no_mark(self, mock_task, _mock_check):
+        mock_task.delay.return_value = MagicMock(id="task-p1")
+        result = _handle_push(_push_payload(branch="main"))
+        assert result["status"] == "accepted"
