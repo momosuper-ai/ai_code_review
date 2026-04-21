@@ -81,12 +81,25 @@ docker-compose logs -f api celery --tail=50
 
 ## Architecture
 
-**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [影响面预分析 → 隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment → （可选）触发 `generate_readme` 任务
+**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [影响面预分析 → 隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment → （可选，仅 MR merge 到主分支 或 push 到主分支）触发 `generate_readme` 任务
 
-**文档生成流**: 审查成功后 → `generate_readme` (Celery, queue=readme) → ReadmeGenerator → [Agent 工具循环或增量更新] → GitLab Commits API 批量提交 → DB 记录
+**文档生成流**: 仅当 `(trigger_type=push 且 branch ∈ MAIN_BRANCHES)` 或 `(trigger_type=merge_request 且 mr_action=merge 且 branch ∈ MAIN_BRANCHES)` 的审查成功时 → `generate_readme` (Celery, queue=readme) → ReadmeGenerator → [Agent 工具循环或增量更新] → 按 trigger_type 分支提交：push 直接 `create_commit` 到主分支；merge 探测主分支 `protected` 字段，未保护走直接 commit，受保护走"临时分支 → commit → MR → 自动合并"绕过 → DB 记录
+
+**重复触发三层防御**:
+1. **Webhook 层**（`src/api/v1/webhooks.py`）：
+   - MR 事件仅 `action == "merge"` 触发（open/update/reopen 完全 ignored）
+   - MR merge 事件分发 `run_review` 后写 Redis 标记 `mr_merge:{project_id}:{commit_sha}` TTL 300s；紧随的目标分支 push 事件命中此标记直接 ignored，保证"merge 仅触发一次"
+   - AI-README 临时分支（前缀 `README_TEMP_BRANCH_PREFIX`）的 push 事件 ignored，防止自动文档 commit 递归触发
+   - AI-README 自动 MR（source_branch 前缀或 title 前缀命中 `README_TEMP_BRANCH_PREFIX` / `README_MR_TITLE_PREFIX`）ignored
+   - Push 事件中所有 commits 均以 `[AI-README]` 开头时 ignored（兜底）
+2. **Task 层**：`run_review` 入口 `_find_recent_review` 按 (project_id, commit_sha) 查询近 30 分钟内是否已有 in_progress/completed 审查，命中则跳过；`_should_dispatch_readme(trigger_type, mr_action, branch)` 防御性校验 README 分发条件；`generate_readme` 入口 `_has_completed_readme` 按 (project_id, branch, commit_sha, status='completed') 查询是否已生成
+3. **DB 层**：`readme_records` 表 partial unique index `(gitlab_project_id, branch, commit_sha) WHERE status='completed'`；并发冲突时 `IntegrityError` 降级为 info 日志，不触发 Celery 重试
+
+所有去重查询均 fail-open（Redis/DB 故障时放行），由下游层级兜底。
 
 ### Core Pipeline (src/tasks/review_task.py)
 
+0. **入口去重**: `_find_recent_review` 查询 (project_id, commit_sha) 近 30 分钟内是否已有 in_progress/completed 审查，命中则直接返回 `{"status":"skipped","reason":"duplicate"}`，不再创建新的 Review 记录
 1. 创建 Review 数据库记录（status: in_progress）
 2. `RepoManager` clone/fetch 本地代码库（filelock 防并发）
 3. **代码图增量更新**: `update_graph_incremental()` 基于 git diff 更新 SQLite 代码图（首次全量扫描，后续增量），失败不阻塞审查
@@ -104,7 +117,7 @@ docker-compose logs -f api celery --tail=50
 9. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
 10. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
 11. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
-12. **文档生成触发**（可选）: `README_GENERATION_ENABLED=true` 时，审查成功后链式分发 `generate_readme.delay()` 到 readme 队列，失败不影响审查流程
+12. **文档生成触发**（可选）: `README_GENERATION_ENABLED=true` 且 branch ∈ `MAIN_BRANCHES` 且 `(trigger_type=push 或 (trigger_type=merge_request 且 mr_action=merge))` 时，审查成功后链式分发 `generate_readme.delay(trigger_type=..., ...)` 到 readme 队列；文档任务根据 `trigger_type` 选择提交路径：push → 直接 commit（成功 push 本身意味着主分支未保护）；merge → 探测主分支 `protected` 字段，受保护走"临时分支 → create_commit → create_merge_request → (可选) accept_merge_request 自动合并"，未保护走直接 commit；失败不影响审查流程
 
 ### Key Modules
 
@@ -113,7 +126,7 @@ docker-compose logs -f api celery --tail=50
 - **src/core/code_graph/** — 代码图模块（影响面分析）：`parser.py` 多语言 AST/正则解析器（Python/JS/TS/Java/Go）；`store.py` SQLite 持久化存储 + FTS5 全文检索；`query.py` `CodeGraph` 高层查询 API（影响面 BFS 追溯），`get_blast_radius` 全文件分析 + `get_blast_radius_for_nodes` 指定节点精确分析；`incremental.py` 基于 git diff 的增量更新（首次全量扫描，后续仅处理变更文件）
 - **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；`TokenUsage` dataclass（prompt/completion/cached tokens + `__iadd__`）、`ChatResult` dataclass（message + usage）；`chat()` 返回 `ChatResult` 支持逐次 token 统计；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
 - **src/core/readme_generator.py** — AI_README.md 文档自动生成引擎：`ReadmeGenerator` 类支持两种模式（首次生成用 Agent 工具调用循环，增量更新用单次 LLM 调用）；结构指纹计算（SHA-256）跳过无变化项目；复用 `AgentToolExecutor` 的 5 个只读工具；`FileAction`/`ReadmeResult` 数据结构；**根目录增量更新采用子目录摘要的增量语义**——`_collect_root_info` 仅把本次变化子目录的 `FileAction` 注入 `subdir_docs` 章节，未出现的子目录通过 prompt 显式指令（`_ROOT_SYSTEM_PROMPT_UPDATE` 硬规则 + blockquote 前导文案）引导 LLM 原样保留现有文档描述，避免"缺失即删除"误判
-- **src/core/gitlab_client.py** — httpx async 客户端，6 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`, `create_commit`）
+- **src/core/gitlab_client.py** — httpx async 客户端，11 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`, `create_commit`, `file_exists`, `get_branch`, `create_branch`, `delete_branch`, `create_merge_request`, `accept_merge_request`）；分支/MR 管理方法用于受保护主分支绕过：`create_branch` 幂等（400 already exists → 返回空 dict），`delete_branch` 非致命（404/网络错误 warning），`accept_merge_request` 处理 405/406/409（pipeline/方法/冲突）降级 warning
 - **src/core/repo_manager.py** — Git 仓库生命周期管理，oauth2 token 注入 clone URL
 - **src/core/privacy_filter.py** — 隐私过滤核心：`SanitizationMapping` 双向映射（original ↔ `<<TYPE_N>>` 占位符）、`PrivacyFilter` 3阶段过滤（`pre_scan` diff预扫描 → `scan_tool_results` 工具结果扫描 → `desanitize_text` 反脱敏）、规则引擎 + 本地LLM混合扫描、`token_usage` 属性跟踪本地模型 token 消耗
 - **src/core/privacy_rules.py** — 敏感数据检测规则库：7类规则（KEY/SECRET/IP/DOMAIN/EMAIL/CERT/CUSTOM）、3个检测等级（minimal仅密钥密码/standard+IP邮箱/strict+高熵字符串）
@@ -122,7 +135,8 @@ docker-compose logs -f api celery --tail=50
 - **src/utils/security.py** — Webhook Token 验证（`verify_gitlab_token`）+ API Key 认证（`require_api_key`），未配置时默认放行（开发模式）
 - **src/utils/rate_limit.py** — Redis 固定窗口速率限制器，`rate_limit_dependency()` 工厂函数返回 FastAPI 依赖；Redis 故障时 fail-open
 - **src/utils/ip_whitelist.py** — `IPWhitelistMiddleware` IP白名单中间件，支持IPv4/IPv6 CIDR，`/health` 始终放行，未配置时全部放行（开发模式）
-- **src/tasks/readme_task.py** — Celery 任务：`generate_readme` 文档生成主入口，编排 ensure_repo → ReadmeGenerator.run() → GitLab Commits API 批量提交 → DB 持久化
+- **src/tasks/readme_task.py** — Celery 任务：`generate_readme` 文档生成主入口（签名含 `trigger_type`），编排 ensure_repo → ReadmeGenerator.run() → 按 trigger_type 分支提交路径：push 直接 `create_commit`，merge 探测主分支 `protected` 后选择直接 commit 或 `_submit_via_temp_branch_mr`（临时分支 → commit → MR → auto-merge） → DB 持久化；入口 `_has_completed_readme` 幂等预检避免重复生成；`_save_readme_record` 捕获 `IntegrityError` 降级为 info
+- **src/utils/redis_client.py** — 同步 Redis 客户端惰性单例，供 rate_limit 与 webhook 抑制标记共享，故障由调用方 fail-open 处理
 - **src/models/readme_record.py** — ORM 模型：`readme_records` 表，追踪文档生成历史和结构指纹
 - **src/api/v1/reviews.py** — 审查记录查询 API（分页列表 + 详情），路由 `/api/v1/reviews`
 - **src/schemas/webhook.py** — Webhook 请求体 Pydantic schema（`MergeRequestEvent`, `PushEvent`）
@@ -130,11 +144,29 @@ docker-compose logs -f api celery --tail=50
 
 ### Webhook Trigger Logic
 
-- **MR 事件**: `object_kind == "merge_request"` && `action in {"open", "update", "reopen", "merge"}` && target_branch 在 MAIN_BRANCHES 中
-  - `open/update/reopen`: 审查源分支代码，结果写入 MR 评论（预防性审查）
-  - `merge`: 审查合并后代码，结果写入 MR 评论（最终确认）
-- **Push 事件**: `object_kind == "push"` && before 非全零 && 有 commits（所有分支均触发，不再限制主分支）
-  - **防递归**: 所有 commit message 均以 `[AI-README]` 开头时跳过（防止文档自动提交触发无限循环）
+- **MR 事件**: `object_kind == "merge_request"` && `action == "merge"` && target_branch 在 MAIN_BRANCHES 中 && source_branch **不**以 `README_TEMP_BRANCH_PREFIX` 开头 && title **不**以 `README_MR_TITLE_PREFIX` 开头
+  - `open/update/reopen`: **不再触发任何任务**（精简为"merge 仅触发一次"的严格语义）
+  - `merge`: 审查合并后代码，结果写入 MR 评论；**触发 README 生成**（trigger_type=merge_request）
+  - `merge` 额外行为：`_mark_mr_merge(project_id, commit_sha)` 写 Redis 标记（TTL 300s），抑制 GitLab 同步发送的目标分支 push 事件
+  - AI-README 自动 MR（source_branch 或 title 命中前缀）：直接 ignored，防止递归
+- **Push 事件**: `object_kind == "push"` && before 非全零 && 有 commits && branch **不**以 `README_TEMP_BRANCH_PREFIX` 开头
+  - **AI-README 临时分支**: branch 以 `ai-readme/` 前缀开头时直接 ignored（受保护分支绕过产生的 push 事件）
+  - **AI-README commit 防递归**: 所有 commit message 均以 `[AI-README]` 开头时跳过
+  - **MR merge 抑制**: `_is_mr_merge_dispatched(project_id, after_sha)` 命中 Redis 标记则跳过，返回 `suppressed by MR merge event`；Redis 故障时 fail-open
+  - **README 触发**: branch ∈ MAIN_BRANCHES 且审查成功 → 链式分发 README（trigger_type=push，直接 commit）
+
+### 受保护主分支处理（仅 merge 链路）
+
+push 到主分支能成功本身即意味着主分支未保护，因此 push 链路无需探测；仅 **merge 链路**需要此流程：
+
+1. `GitLabClient.get_branch(project_id, main_branch)` 获取 `protected` 字段
+2. 未保护（`protected=False`）：直接 `create_commit` 到主分支
+3. 受保护（`protected=True`）：走 `_submit_via_temp_branch_mr` 流程：
+   - `create_branch(ai-readme/{ts}-{sha8}, ref=main_branch)` — 时间戳避免同 sha 重试冲突
+   - `create_commit` 到临时分支；失败时 `delete_branch` 清理残留后抛出
+   - `create_merge_request(source=temp, target=main_branch, title="[AI-README] 更新 AI_README ({sha8})")`
+   - `README_MR_AUTO_MERGE=true` 时调用 `accept_merge_request`（`should_remove_source_branch=README_MR_AUTO_MERGE_REMOVE_BRANCH`），失败降级 warning 人工兜底
+4. 整条链路由 webhook 层 AI-README 前缀过滤防止递归触发审查
 
 ### Database
 
@@ -145,7 +177,8 @@ PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录�
 - `review_comments` 表新增 `dimension` 字段（String(50), nullable），记录问题所属审查维度
 - `reviews` 表新增 `total_prompt_tokens`、`total_completion_tokens`、`total_cached_tokens` 字段（Integer, default=0），持久化 token 统计
 - `readme_records` 表：追踪文档生成历史（project_id, branch, commit_sha, fingerprint, status, token 统计等）
-- Alembic 迁移: `001_add_dimension_to_review_comments.py`、`002_add_token_columns_to_reviews.py`、`003_add_readme_records.py`
+- `readme_records` **partial unique index** `ix_readme_records_unique_completed`：`(gitlab_project_id, branch, commit_sha) WHERE status='completed'`，保证同一提交仅有一条成功记录（失败记录不受约束，便于排查）；并发冲突时 `IntegrityError` 降级为 info
+- Alembic 迁移: `001_add_dimension_to_review_comments.py`、`002_add_token_columns_to_reviews.py`、`003_add_readme_records.py`、`004_add_readme_records_unique.py`
 
 ### API Endpoints
 
@@ -313,6 +346,11 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | `README_COMMIT_MESSAGE_PREFIX` | `[AI-README]` | 提交信息前缀（防递归标识） |
 | `README_AUTHOR_NAME` | `AI-README Bot` | Git 提交作者名 |
 | `README_AUTHOR_EMAIL` | `ai-readme@noreply.local` | Git 提交作者邮箱 |
+| `README_TEMP_BRANCH_PREFIX` | `ai-readme/` | 受保护主分支绕过时的临时分支前缀（webhook 据此识别并 ignored） |
+| `README_MR_TITLE_PREFIX` | `[AI-README]` | 自动 MR 标题前缀（webhook 据此识别并 ignored） |
+| `README_MR_AUTO_MERGE` | `true` | 受保护分支场景下是否自动合并临时分支 MR |
+| `README_MR_AUTO_MERGE_REMOVE_BRANCH` | `true` | 自动合并后是否删除临时源分支 |
+| `README_MR_DESCRIPTION` | `Automated AI_README.md update...` | 自动 MR 的描述文案 |
 
 ### 多维度审查
 | 配置项 | 默认值 | 说明 |
