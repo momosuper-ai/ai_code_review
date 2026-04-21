@@ -115,6 +115,17 @@ def _handle_push(payload: dict) -> dict:
         )
         return {"status": "ignored", "reason": "no commits"}
 
+    # 防递归：AI_README 自动提交不触发任何后续任务
+    commits = payload.get("commits", [])
+    if commits and all(
+        c.get("message", "").startswith("[AI-README]") for c in commits
+    ):
+        logger.debug(
+            "Webhook 事件已忽略: 项目=%s 原因=AI_README 自动提交",
+            project_name,
+        )
+        return {"status": "ignored", "reason": "AI_README auto-commit"}
+
     project_id = project.get("id")
     after = payload.get("after", "")
     author = payload.get("user_name", "unknown")

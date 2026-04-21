@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     BLAST_RADIUS_MAX_ITEMS: int = 30        # 预注入的最大符号数量
     BLAST_RADIUS_MAX_CHARS: int = 4000      # 预注入文本的最大字符数（~1300 tokens）
 
+    # AI_README 文档自动生成
+    README_GENERATION_ENABLED: bool = False
+    README_MIN_CODE_LINES: int = 200
+    README_LLM_MAX_TOKENS: int = 4096
+    README_AGENT_MAX_ROUNDS: int = 8
+    README_MAX_SUBDIRS: int = 15
+    README_CONCURRENCY: int = 2
+    README_COMMIT_MESSAGE_PREFIX: str = "[AI-README]"
+    README_AUTHOR_NAME: str = "AI-README Bot"
+    README_AUTHOR_EMAIL: str = "ai-readme@noreply.local"
+
     # SonarQube（预留）
     SONARQUBE_URL: str = ""
     SONARQUBE_TOKEN: str = ""

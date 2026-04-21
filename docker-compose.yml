@@ -38,7 +38,7 @@ services:
       - repos_data:/data/repos
       - logs_data:/data/logs
     restart: unless-stopped
-    command: celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOG_LEVEL:-info} --concurrency=${CELERY_CONCURRENCY:-2} -Q review,celery
+    command: celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOG_LEVEL:-info} --concurrency=${CELERY_CONCURRENCY:-2} -Q review,celery,readme
     logging:
       driver: "json-file"
       options:

@@ -4,6 +4,7 @@ import asyncio
 import time
 from datetime import datetime
 
+from src.config import settings
 from src.core.gitlab_client import GitLabClient
 from src.core.repo_manager import RepoManager
 from src.core.review_engine import ReviewEngine
@@ -107,6 +108,20 @@ def run_review(
             )
         except Exception:
             logger.error("[review:%d] GitLab 评论发送失败", review_id, exc_info=True)
+
+        # 5. 触发文档生成（审查成功后，失败不影响审查流程）
+        if settings.README_GENERATION_ENABLED:
+            try:
+                from src.tasks.readme_task import generate_readme
+                generate_readme.delay(
+                    project_id=project_id,
+                    project_name=project_name,
+                    branch=branch,
+                    commit_sha=commit_sha,
+                )
+                logger.info("[review:%d] 已分发文档生成任务", review_id)
+            except Exception:
+                logger.warning("[review:%d] 文档生成任务分发失败", review_id, exc_info=True)
 
         total_time = time.time() - task_start
         total_tokens = result.get("total_prompt_tokens", 0) + result.get("total_completion_tokens", 0)

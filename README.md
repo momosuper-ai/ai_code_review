@@ -13,6 +13,7 @@
 - **安全防护**：Webhook Token 验证、API Key 认证、IP 白名单、Redis 速率限制
 - **智能容错**：LLM 调用指数退避重试、上下文自动裁剪、JSON 格式重试纠正、降级 fallback 解析
 - **结果回写**：审查报告格式化为 Markdown 评论，自动发布到 GitLab
+- **AI_README 自动生成**（可选）：审查成功后链式触发，为项目根目录和主要子目录生成/更新 `AI_README.md` 文档；首次用 Agent 工具循环、后续用结构指纹 + 单次 LLM 调用增量更新；通过 GitLab Commits API 批量提交，`[AI-README]` 前缀 + Push 事件过滤双重防递归
 - **历史记录**：所有审查记录和问题明细持久化到 PostgreSQL，支持通过 API 查询
 - **异步处理**：基于 Celery + Redis 的异步任务队列，Webhook 即时响应不阻塞
 
@@ -42,6 +43,9 @@ GitLab Webhook (MR open/update/reopen/merge / Push)
        +-- 8. 跨维度去重 + 加权评分
        +-- 9. 持久化审查记录到数据库
        +-- 10. 格式化 Markdown 报告 -> 回写 GitLab 评论
+       +-- 11. （可选）链式触发 AI_README 文档生成任务
+                  ReadmeGenerator: 扫描子目录 -> 指纹比对 -> 生成/更新
+                    -> GitLab Commits API 批量提交（`[AI-README]` 前缀）
 ```
 
 ## 环境要求
@@ -235,8 +239,9 @@ Reviews API 通过 `X-API-Key` header 验证访问权限。
 
 - **所有分支**的推送均触发（不限制主分支）
 - 过滤条件：不是新建分支（before SHA 非全零）且包含至少一个 commit
+- **防递归**：若本次 push 的**所有** commit message 均以 `[AI-README]` 开头（来自文档自动提交），则直接忽略，防止文档生成 → push → 再生成的无限循环
 
-以下情况**不会**触发：新建分支的推送、无 commit 的推送。
+以下情况**不会**触发：新建分支的推送、无 commit 的推送、全部为 `[AI-README]` 标记的推送。
 
 ## 审查报告说明
 
@@ -454,6 +459,20 @@ GET /api/v1/reviews/{review_id}
 | `PRIVACY_TOOL_SCAN_MODE` | `hybrid` | hybrid=规则+模型 / rules_only=仅规则 |
 | `PRIVACY_CUSTOM_PATTERNS` | `""` | 自定义正则（JSON 数组） |
 
+### AI_README 文档生成
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `README_GENERATION_ENABLED` | `false` | 功能总开关，`true` 时审查成功后链式触发文档生成 |
+| `README_MIN_CODE_LINES` | `200` | 子目录最小代码行数阈值（低于则跳过） |
+| `README_LLM_MAX_TOKENS` | `4096` | LLM 最大输出 token |
+| `README_AGENT_MAX_ROUNDS` | `8` | 首次生成 Agent 工具调用最大轮数 |
+| `README_MAX_SUBDIRS` | `15` | 最大处理子目录数量 |
+| `README_CONCURRENCY` | `2` | 子目录文档并发生成数 |
+| `README_COMMIT_MESSAGE_PREFIX` | `[AI-README]` | 提交信息前缀（防递归标识） |
+| `README_AUTHOR_NAME` | `AI-README Bot` | Git 提交作者名 |
+| `README_AUTHOR_EMAIL` | `ai-readme@noreply.local` | Git 提交作者邮箱 |
+
 ## 运维指南
 
 ### 查看日志
@@ -559,18 +578,21 @@ obc_ai_code_review/
 │   │   ├── context_manager.py    # 上下文长度管理（4阶段裁剪）
 │   │   ├── privacy_filter.py     # 隐私过滤核心（3阶段流水线）
 │   │   ├── privacy_rules.py      # 敏感数据检测规则库（7类规则）
+│   │   ├── readme_generator.py   # AI_README 文档自动生成引擎
 │   │   └── code_graph/           # 代码图模块（影响面分析）
 │   │       ├── parser.py         # 多语言 AST 解析器
 │   │       ├── store.py          # SQLite 持久化 + FTS5
 │   │       ├── query.py          # 高层查询 API
 │   │       └── incremental.py    # 基于 git diff 增量更新
 │   ├── models/                   # 数据库模型
-│   │   └── review.py             # Review / ReviewComment
+│   │   ├── review.py             # Review / ReviewComment
+│   │   └── readme_record.py      # ReadmeRecord (文档生成历史)
 │   ├── schemas/                  # 请求/响应 Schema
 │   │   └── webhook.py            # Webhook Pydantic 模型
 │   ├── tasks/                    # Celery 异步任务
 │   │   ├── celery_app.py         # Celery 实例配置
-│   │   └── review_task.py        # 审查任务编排
+│   │   ├── review_task.py        # 审查任务编排
+│   │   └── readme_task.py        # AI_README 生成任务
 │   └── utils/                    # 工具模块
 │       ├── logger.py             # 日志基础设施（JSON/Text双格式）
 │       ├── security.py           # Webhook Token + API Key 认证
@@ -584,7 +606,9 @@ obc_ai_code_review/
         ├── test_privacy_filter.py
         ├── test_review_engine.py
         ├── test_webhooks.py
-        └── test_code_graph.py
+        ├── test_code_graph.py
+        ├── test_gitlab_client.py
+        └── test_readme_generator.py
 ```
 
 ## 常见问题
@@ -646,3 +670,19 @@ PRIVACY_FILTER_ENABLED=true
 ### API 返回 401 Unauthorized（Reviews API）
 
 检查请求中 `X-API-Key` header 是否正确，确认 `.env` 中 `API_KEYS` 配置包含该密钥。
+
+### 如何启用 AI_README 文档自动生成
+
+设置 `.env` 中 `README_GENERATION_ENABLED=true` 并重启服务：
+
+```bash
+docker-compose down
+docker-compose up --build -d
+docker-compose exec api alembic upgrade head   # 首次启用需确保 readme_records 表已迁移
+```
+
+启用后，每次审查成功会链式分发 `generate_readme` 任务：仅对代码行数 ≥ `README_MIN_CODE_LINES`（默认 200）的子目录生成/更新文档；已存在文档通过结构指纹（根目录名单+关键配置 / 子目录代码文件哈希）判断是否需要更新；文档通过 GitLab Commits API 批量提交，作者为 `AI-README Bot`、commit message 前缀 `[AI-README]`。
+
+### AI_README 生成后触发了新一轮审查
+
+不会。Webhook 层对 Push 事件做了防递归检查：若 push 的**所有** commit message 均以 `[AI-README]` 开头，webhook 直接忽略，不分发审查任务。如需自定义前缀，修改 `.env` 中 `README_COMMIT_MESSAGE_PREFIX` 并同步调整 webhook 过滤逻辑。

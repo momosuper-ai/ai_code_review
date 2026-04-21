@@ -17,6 +17,8 @@ _SKIP_PATTERNS = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Pipfile.lock",
     "poetry.lock", "Gemfile.lock", "composer.lock", "Cargo.lock",
     "go.sum",
+    # Auto-generated docs
+    "AI_README.md",
 }
 
 _SKIP_EXTENSIONS = {

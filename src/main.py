@@ -8,6 +8,7 @@ from src.api.router import api_router
 from src.config import settings
 from src.models import Base, engine, ensure_database_exists
 from src.models.review import Review, ReviewComment  # noqa: F401
+from src.models.readme_record import ReadmeRecord  # noqa: F401
 from src.utils.ip_whitelist import IPWhitelistMiddleware
 from src.utils.logger import logger
 

@@ -20,14 +20,46 @@ AI 代码审查服务：通过 GitLab Webhook 自动触发，支持本地 vLLM +
 
 ## Build & Run
 
+### 首次部署
+
 ```bash
-# 启动核心服务 + 基础设施（共 7 个容器）
+# 1. 复制环境变量模板并填入实际值
+cp .env.example .env
+# 编辑 .env 填入数据库密码、GitLab Token、Redis 密码等
+
+# 2. 启动所有服务（前台，可观察日志）
 docker-compose up --build
 
-# 仅重建并启动
+# 3. 数据库迁移（在另一个终端，容器 postgres 启动后执行）
+docker-compose exec api alembic upgrade head
+```
+
+### 功能更新部署（标准流程）
+
+当代码或配置有变更时，必须按以下顺序操作：
+
+```bash
+# 1. 停止现有服务
+docker-compose down
+
+# 2. 重建镜像并启动（-d 后台运行）
 docker-compose up --build -d
 
-# 运行测试
+# 3. 执行数据库迁移（如果有新的 alembic 迁移脚本）
+docker-compose exec api alembic upgrade head
+
+# 4. 验证服务状态
+docker-compose ps                      # 确认所有容器 running
+curl http://localhost:8080/health       # 确认 API 健康
+docker-compose logs -f celery --tail=20 # 观察 worker 日志
+```
+
+> **重要**：任何涉及数据库 schema 变更（新增/修改表或字段）的更新，都必须在容器启动后执行 `alembic upgrade head`。虽然 `main.py` lifespan 会自动 `create_all`，但 Alembic 迁移脚本能确保增量变更的正确性和版本追踪。
+
+### 开发常用命令
+
+```bash
+# 运行全量测试
 pip install ".[dev]"
 pytest tests/
 
@@ -37,14 +69,21 @@ pytest tests/unit/test_agent_tools.py
 # 运行单个测试
 pytest tests/unit/test_agent_tools.py::TestReadFile::test_read_existing_file
 
-# 数据库迁移
-alembic revision --autogenerate -m "description"
-alembic upgrade head
+# 创建新迁移脚本
+docker-compose exec api alembic revision --autogenerate -m "description"
+
+# 查看当前迁移版本
+docker-compose exec api alembic current
+
+# 查看实时日志
+docker-compose logs -f api celery --tail=50
 ```
 
 ## Architecture
 
-**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [影响面预分析 → 隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment
+**请求流**: GitLab Webhook → FastAPI (`webhooks.py`) → Celery task (`review_task.py`) → ReviewEngine → [影响面预分析 → 隐私预扫描 → 多维度Agent并行审查 → 结果反脱敏] → DB 持久化 → GitLab comment → （可选）触发 `generate_readme` 任务
+
+**文档生成流**: 审查成功后 → `generate_readme` (Celery, queue=readme) → ReadmeGenerator → [Agent 工具循环或增量更新] → GitLab Commits API 批量提交 → DB 记录
 
 ### Core Pipeline (src/tasks/review_task.py)
 
@@ -65,6 +104,7 @@ alembic upgrade head
 9. **结果反脱敏**（双模型模式）: 占位符 → 原始值还原
 10. 持久化 Review + ReviewComment 到 PostgreSQL（**先DB后评论**，评论失败不影响数据持久化）
 11. 格式化 Markdown 评论（支持多维度和单Agent两种格式），回写 GitLab（MR note 或 commit comment）
+12. **文档生成触发**（可选）: `README_GENERATION_ENABLED=true` 时，审查成功后链式分发 `generate_readme.delay()` 到 readme 队列，失败不影响审查流程
 
 ### Key Modules
 
@@ -72,7 +112,8 @@ alembic upgrade head
 - **src/core/agent_tools.py** — 6 个沙箱工具（read_file, search_code, list_directory, find_definition, get_file_info, get_blast_radius），`AgentToolExecutor` 基类做路径越界检查和输出截断（20000 字符 / 500 行上限）；`find_definition` 支持 10+ 语言的定义正则匹配；`get_blast_radius` 利用代码图分析变更影响面（上游调用者/下游被调用者）
 - **src/core/code_graph/** — 代码图模块（影响面分析）：`parser.py` 多语言 AST/正则解析器（Python/JS/TS/Java/Go）；`store.py` SQLite 持久化存储 + FTS5 全文检索；`query.py` `CodeGraph` 高层查询 API（影响面 BFS 追溯），`get_blast_radius` 全文件分析 + `get_blast_radius_for_nodes` 指定节点精确分析；`incremental.py` 基于 git diff 的增量更新（首次全量扫描，后续仅处理变更文件）
 - **src/core/llm_client.py** — AsyncOpenAI SDK 封装，连接 vLLM (OpenAI compatible API)；`TokenUsage` dataclass（prompt/completion/cached tokens + `__iadd__`）、`ChatResult` dataclass（message + usage）；`chat()` 返回 `ChatResult` 支持逐次 token 统计；内置指数退避重试（RateLimitError/APIConnectionError/5xx 可重试）；集成上下文裁剪（`trim_messages` 前置调用）和隐私过滤（`sanitize_messages` 发送前脱敏）
-- **src/core/gitlab_client.py** — httpx async 客户端，5 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`）
+- **src/core/readme_generator.py** — AI_README.md 文档自动生成引擎：`ReadmeGenerator` 类支持两种模式（首次生成用 Agent 工具调用循环，增量更新用单次 LLM 调用）；结构指纹计算（SHA-256）跳过无变化项目；复用 `AgentToolExecutor` 的 5 个只读工具；`FileAction`/`ReadmeResult` 数据结构；**根目录增量更新采用子目录摘要的增量语义**——`_collect_root_info` 仅把本次变化子目录的 `FileAction` 注入 `subdir_docs` 章节，未出现的子目录通过 prompt 显式指令（`_ROOT_SYSTEM_PROMPT_UPDATE` 硬规则 + blockquote 前导文案）引导 LLM 原样保留现有文档描述，避免"缺失即删除"误判
+- **src/core/gitlab_client.py** — httpx async 客户端，6 个 GitLab API 方法（`get_project`, `get_mr_changes`, `get_compare`, `post_mr_note`, `post_commit_comment`, `create_commit`）
 - **src/core/repo_manager.py** — Git 仓库生命周期管理，oauth2 token 注入 clone URL
 - **src/core/privacy_filter.py** — 隐私过滤核心：`SanitizationMapping` 双向映射（original ↔ `<<TYPE_N>>` 占位符）、`PrivacyFilter` 3阶段过滤（`pre_scan` diff预扫描 → `scan_tool_results` 工具结果扫描 → `desanitize_text` 反脱敏）、规则引擎 + 本地LLM混合扫描、`token_usage` 属性跟踪本地模型 token 消耗
 - **src/core/privacy_rules.py** — 敏感数据检测规则库：7类规则（KEY/SECRET/IP/DOMAIN/EMAIL/CERT/CUSTOM）、3个检测等级（minimal仅密钥密码/standard+IP邮箱/strict+高熵字符串）
@@ -81,6 +122,8 @@ alembic upgrade head
 - **src/utils/security.py** — Webhook Token 验证（`verify_gitlab_token`）+ API Key 认证（`require_api_key`），未配置时默认放行（开发模式）
 - **src/utils/rate_limit.py** — Redis 固定窗口速率限制器，`rate_limit_dependency()` 工厂函数返回 FastAPI 依赖；Redis 故障时 fail-open
 - **src/utils/ip_whitelist.py** — `IPWhitelistMiddleware` IP白名单中间件，支持IPv4/IPv6 CIDR，`/health` 始终放行，未配置时全部放行（开发模式）
+- **src/tasks/readme_task.py** — Celery 任务：`generate_readme` 文档生成主入口，编排 ensure_repo → ReadmeGenerator.run() → GitLab Commits API 批量提交 → DB 持久化
+- **src/models/readme_record.py** — ORM 模型：`readme_records` 表，追踪文档生成历史和结构指纹
 - **src/api/v1/reviews.py** — 审查记录查询 API（分页列表 + 详情），路由 `/api/v1/reviews`
 - **src/schemas/webhook.py** — Webhook 请求体 Pydantic schema（`MergeRequestEvent`, `PushEvent`）
 - **src/api/router.py** — API 路由聚合，前缀 `/api/v1`
@@ -91,16 +134,18 @@ alembic upgrade head
   - `open/update/reopen`: 审查源分支代码，结果写入 MR 评论（预防性审查）
   - `merge`: 审查合并后代码，结果写入 MR 评论（最终确认）
 - **Push 事件**: `object_kind == "push"` && before 非全零 && 有 commits（所有分支均触发，不再限制主分支）
+  - **防递归**: 所有 commit message 均以 `[AI-README]` 开头时跳过（防止文档自动提交触发无限循环）
 
 ### Database
 
-PostgreSQL + SQLAlchemy 双引擎设计。两张表：`reviews`（审查记录）1:N `review_comments`（问题明细）。启动时自动建表（`main.py` lifespan）。
+PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录）1:N `review_comments`（问题明细）、`readme_records`（文档生成历史）。启动时自动建表（`main.py` lifespan）。
 
 - FastAPI 使用异步引擎（`asyncpg`）
 - Celery Worker 使用同步引擎（`psycopg2`），通过 `DATABASE_URL_SYNC` property 自动转换
 - `review_comments` 表新增 `dimension` 字段（String(50), nullable），记录问题所属审查维度
 - `reviews` 表新增 `total_prompt_tokens`、`total_completion_tokens`、`total_cached_tokens` 字段（Integer, default=0），持久化 token 统计
-- Alembic 迁移: `001_add_dimension_to_review_comments.py`、`002_add_token_columns_to_reviews.py`
+- `readme_records` 表：追踪文档生成历史（project_id, branch, commit_sha, fingerprint, status, token 统计等）
+- Alembic 迁移: `001_add_dimension_to_review_comments.py`、`002_add_token_columns_to_reviews.py`、`003_add_readme_records.py`
 
 ### API Endpoints
 
@@ -171,6 +216,19 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - PostgreSQL `POSTGRES_PASSWORD` 环境变量仅在首次初始化（pgdata 卷为空）时生效，修改密码后需手动 `ALTER USER` 或删除 pgdata 卷重建
 - `.env` 中包含敏感信息（Token、API Key），不应提交到公开仓库
 - Docker 容器命名遵循 `{项目目录名}_{服务名}_{序号}` 格式（下划线分隔）
+
+### 向用户提供部署指导时的完整性要求
+
+当涉及部署或重部署操作时，**必须给出完整的端到端操作步骤**，不能遗漏任何环节。以下是需要逐一检查并告知用户的事项清单：
+
+1. **停止现有服务**: 是否需要先 `docker-compose down` 停止旧容器
+2. **环境变量同步**: `.env` 文件是否需要新增/修改配置项（对照 `.env.example` 差异）
+3. **镜像重建**: `docker-compose up --build -d`
+4. **数据库迁移**: 是否有新的 Alembic 迁移脚本需要执行 `alembic upgrade head`
+5. **服务验证**: 提供验证命令（`docker-compose ps`、`curl /health`、日志观察等）
+6. **回滚方案**: 如出现问题，如何回退（如 `alembic downgrade -1`）
+
+遗漏任何一步都可能导致部署失败或数据不一致。宁可多写一行命令，不要假设用户知道隐含步骤。
 
 ## Code Style Guide
 
@@ -243,6 +301,19 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 |--------|--------|------|
 | `CLOUD_LLM_MODEL_NAME` | `""` | 云端模型名，非空启用双模型模式 |
 
+### AI_README 文档生成
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `README_GENERATION_ENABLED` | `false` | 功能总开关 |
+| `README_MIN_CODE_LINES` | `200` | 子目录最小代码行数阈值 |
+| `README_LLM_MAX_TOKENS` | `4096` | LLM 最大输出 token |
+| `README_AGENT_MAX_ROUNDS` | `8` | 首次生成 Agent 工具调用最大轮数 |
+| `README_MAX_SUBDIRS` | `15` | 最大处理子目录数量 |
+| `README_CONCURRENCY` | `2` | 子目录文档并发生成数 |
+| `README_COMMIT_MESSAGE_PREFIX` | `[AI-README]` | 提交信息前缀（防递归标识） |
+| `README_AUTHOR_NAME` | `AI-README Bot` | Git 提交作者名 |
+| `README_AUTHOR_EMAIL` | `ai-readme@noreply.local` | Git 提交作者邮箱 |
+
 ### 多维度审查
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -291,3 +362,4 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - `test_review_engine.py` — 审查引擎解析和格式化测试
 - `test_webhooks.py` — Webhook 路由和事件处理测试
 - `test_code_graph.py` — 代码图解析器、存储、查询和影响面分析测试
+- `test_readme_generator.py` — AI_README 文档生成引擎测试（指纹计算、行数统计、工具过滤、防递归等）

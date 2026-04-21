@@ -18,10 +18,14 @@ celery_app.conf.update(
     task_track_started=True,
     task_routes={
         "src.tasks.review_task.run_review": {"queue": "review"},
+        "src.tasks.readme_task.generate_readme": {"queue": "readme"},
     },
 )
 
-celery_app.autodiscover_tasks(["src.tasks"], related_name="review_task")
+celery_app.conf.include = [
+    "src.tasks.review_task",
+    "src.tasks.readme_task",
+]
 
 
 @worker_init.connect
