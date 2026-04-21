@@ -2,7 +2,9 @@
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
 
 from src.config import settings
 from src.core.gitlab_client import GitLabClient
@@ -12,6 +14,32 @@ from src.models import SyncSession
 from src.models.review import Review, ReviewComment, ReviewStatus, Severity, TriggerType
 from src.tasks.celery_app import celery_app
 from src.utils.logger import logger
+
+# 幂等窗口：同一 (project_id, commit_sha) 在该窗口内已存在 in_progress/completed review 则跳过
+_REVIEW_DEDUP_WINDOW = timedelta(minutes=30)
+
+
+def _should_dispatch_readme(
+    trigger_type: str,
+    mr_action: str | None,
+    branch: str,
+) -> bool:
+    """README 触发矩阵：push 到主分支，或 MR merge action 到主分支。
+
+    Task 层防御性校验，与 webhook 层过滤组合形成双保险：
+    - push 到特性分支 → False
+    - MR open/update/reopen（即使透传到 task）→ False
+    - push 到主分支 或 merge_request+merge 到主分支 → True
+    """
+    if not settings.README_GENERATION_ENABLED:
+        return False
+    if branch not in settings.main_branch_list:
+        return False
+    if trigger_type == "push":
+        return True
+    if trigger_type == "merge_request" and mr_action == "merge":
+        return True
+    return False
 
 
 @celery_app.task(
@@ -31,6 +59,7 @@ def run_review(
     author: str,
     mr_iid: int | None = None,
     mr_title: str | None = None,
+    mr_action: str | None = None,
     before_sha: str | None = None,
 ):
     """Main review task entry point."""
@@ -40,7 +69,20 @@ def run_review(
     )
     task_start = time.time()
 
-    # 1. 同步创建 review 记录
+    # 1. 入口去重：同一 (project_id, commit_sha) 近 30 分钟内已有 in_progress/completed 审查则跳过
+    existing = _find_recent_review(project_id, commit_sha)
+    if existing is not None:
+        logger.info(
+            "审查任务已去重跳过: 项目=%s 提交=%s 触发=%s 现有=review_id=%d status=%s",
+            project_name, commit_sha[:8], trigger_type, existing.id, existing.status.value,
+        )
+        return {
+            "status": "skipped",
+            "reason": "duplicate",
+            "existing_review_id": existing.id,
+        }
+
+    # 2. 同步创建 review 记录
     with SyncSession() as session:
         review = Review(
             gitlab_project_id=project_id,
@@ -109,17 +151,21 @@ def run_review(
         except Exception:
             logger.error("[review:%d] GitLab 评论发送失败", review_id, exc_info=True)
 
-        # 5. 触发文档生成（审查成功后，失败不影响审查流程）
-        if settings.README_GENERATION_ENABLED:
+        # 5. 触发文档生成（push 到主分支 或 MR merge 到主分支；失败不影响审查流程）
+        if _should_dispatch_readme(trigger_type, mr_action, branch):
             try:
                 from src.tasks.readme_task import generate_readme
                 generate_readme.delay(
+                    trigger_type=trigger_type,
                     project_id=project_id,
                     project_name=project_name,
                     branch=branch,
                     commit_sha=commit_sha,
                 )
-                logger.info("[review:%d] 已分发文档生成任务", review_id)
+                logger.info(
+                    "[review:%d] 已分发文档生成任务 trigger=%s branch=%s",
+                    review_id, trigger_type, branch,
+                )
             except Exception:
                 logger.warning("[review:%d] 文档生成任务分发失败", review_id, exc_info=True)
 
@@ -284,6 +330,31 @@ def _save_review_result(review_id: int, result: dict) -> None:
             session.add(comment)
         session.commit()
     logger.info("[review:%d] 结果已持久化到数据库 (%.1f秒)", review_id, time.time() - t0)
+
+
+def _find_recent_review(project_id: int, commit_sha: str) -> Review | None:
+    """查询近 30 分钟内是否已有同 (project_id, commit_sha) 的 in_progress/completed 审查。
+
+    故障时返回 None（fail-open）——保留原有行为，由下游 DB 约束和 Redis 抑制兜底。
+    """
+    try:
+        cutoff = datetime.utcnow() - _REVIEW_DEDUP_WINDOW
+        with SyncSession() as session:
+            stmt = (
+                select(Review)
+                .where(
+                    Review.gitlab_project_id == project_id,
+                    Review.commit_sha == commit_sha,
+                    Review.status.in_([ReviewStatus.in_progress, ReviewStatus.completed]),
+                    Review.created_at >= cutoff,
+                )
+                .order_by(Review.created_at.desc())
+                .limit(1)
+            )
+            return session.execute(stmt).scalar_one_or_none()
+    except Exception:
+        logger.warning("审查去重查询失败，放行任务（fail-open）", exc_info=True)
+        return None
 
 
 def _mark_review_failed(review_id: int, exc: Exception) -> None:
