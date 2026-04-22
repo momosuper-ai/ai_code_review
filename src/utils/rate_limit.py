@@ -7,6 +7,7 @@ from fastapi import HTTPException, Request
 
 from src.config import settings
 from src.utils.logger import logger
+from src.utils.redis_client import get_redis
 
 _WINDOW_UNITS = {
     "second": 1,
@@ -31,27 +32,10 @@ def parse_rate_limit(spec: str) -> RateLimit:
     return RateLimit(max_requests=max_requests, window_seconds=_WINDOW_UNITS[unit])
 
 
-_redis_client = None
-
-
-def _get_redis():
-    """惰性初始化同步 Redis 客户端。"""
-    global _redis_client
-    if _redis_client is None:
-        import redis
-        _redis_client = redis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-        )
-    return _redis_client
-
-
 def check_rate_limit(key: str, limit: RateLimit) -> tuple[bool, int, int]:
     """检查速率限制，返回 (allowed, remaining, retry_after)。"""
     try:
-        r = _get_redis()
+        r = get_redis()
         window_id = int(time.time()) // limit.window_seconds
         redis_key = f"ratelimit:{key}:{window_id}"
 

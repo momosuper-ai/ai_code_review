@@ -26,6 +26,10 @@ def _mark_mr_merge(project_id: int, commit_sha: str) -> None:
         return
     try:
         get_redis().setex(_mr_merge_mark_key(project_id, commit_sha), _MR_MERGE_SUPPRESS_TTL, "1")
+        logger.info(
+            "已写入 MR merge 抑制标记: project_id=%s commit=%s TTL=%ss (将抑制同 commit 的 push 事件)",
+            project_id, commit_sha[:8], _MR_MERGE_SUPPRESS_TTL,
+        )
     except Exception:
         logger.warning("Redis 写入 MR merge 标记失败，降级由 task 层去重")
 
@@ -57,7 +61,7 @@ async def gitlab_webhook(
     elif object_kind == "push":
         return _handle_push(payload)
     else:
-        logger.debug("Webhook 事件已忽略: 事件类型=%s 原因=不支持的事件类型", object_kind)
+        logger.info("Webhook 事件已忽略: 事件类型=%s 原因=不支持的事件类型", object_kind)
         return {"status": "ignored", "reason": f"unsupported event: {object_kind}"}
 
 
@@ -73,28 +77,30 @@ def _handle_mr(payload: dict) -> dict:
     project = payload.get("project", {})
     project_name = project.get("path_with_namespace", "")
 
+    mr_iid = attrs.get("iid")
+
     # 防递归：AI-README 自动 MR（由临时分支合并至主分支）不触发任何任务
     if (
         source_branch.startswith(settings.README_TEMP_BRANCH_PREFIX)
         or mr_title.startswith(settings.README_MR_TITLE_PREFIX)
     ):
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s 原因=AI-README 自动 MR (source=%s title=%s)",
-            project_name, source_branch, mr_title,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s MR=%s 原因=AI-README 自动 MR (source=%s title=%s)",
+            project_name, mr_iid, source_branch, mr_title,
         )
         return {"status": "ignored", "reason": "ai_readme_mr"}
 
     if action not in _MR_REVIEW_ACTIONS:
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s 原因=action=%s 不在审查触发列表中",
-            project_name, action,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s MR=%s 原因=action=%s 不在审查触发列表中 (仅 merge 触发)",
+            project_name, mr_iid, action,
         )
         return {"status": "ignored", "reason": f"action={action}, not reviewable"}
 
     if target_branch not in settings.main_branch_list:
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s 原因=目标分支 %s 不在主分支列表中",
-            project_name, target_branch,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=merge_request 项目=%s MR=%s 原因=目标分支 %s 不在主分支列表 %s 中",
+            project_name, mr_iid, target_branch, settings.main_branch_list,
         )
         return {
             "status": "ignored",
@@ -102,7 +108,6 @@ def _handle_mr(payload: dict) -> dict:
         }
 
     project_id = project.get("id")
-    mr_iid = attrs.get("iid")
     commit_sha = (attrs.get("last_commit") or {}).get("id", "")
     author = (payload.get("user") or {}).get("username", "unknown")
     # 合并事件使用目标分支，其他事件使用源分支（代码在源分支上）
@@ -149,23 +154,23 @@ def _handle_push(payload: dict) -> dict:
 
     # 防递归：AI-README 临时分支的 push 事件（由 _submit_via_temp_branch_mr 触发）不触发任何任务
     if branch.startswith(settings.README_TEMP_BRANCH_PREFIX):
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=AI-README 临时分支",
-            project_name, branch,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=AI-README 临时分支 (前缀=%s)",
+            project_name, branch, settings.README_TEMP_BRANCH_PREFIX,
         )
         return {"status": "ignored", "reason": "ai_readme_temp_branch"}
 
     if before == _NULL_SHA:
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=push 项目=%s 原因=分支创建事件",
-            project_name,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=分支创建事件 (before=null SHA)",
+            project_name, branch,
         )
         return {"status": "ignored", "reason": "branch creation event"}
 
     if total_commits == 0:
-        logger.debug(
-            "Webhook 事件已忽略: 事件类型=push 项目=%s 原因=无提交",
-            project_name,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=无提交",
+            project_name, branch,
         )
         return {"status": "ignored", "reason": "no commits"}
 
@@ -174,9 +179,9 @@ def _handle_push(payload: dict) -> dict:
     if commits and all(
         c.get("message", "").startswith("[AI-README]") for c in commits
     ):
-        logger.debug(
-            "Webhook 事件已忽略: 项目=%s 原因=AI_README 自动提交",
-            project_name,
+        logger.info(
+            "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=AI_README 自动提交 (commits=%d 均以 [AI-README] 开头)",
+            project_name, branch, len(commits),
         )
         return {"status": "ignored", "reason": "AI_README auto-commit"}
 

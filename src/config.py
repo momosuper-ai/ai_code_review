@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     README_COMMIT_MESSAGE_PREFIX: str = "[AI-README]"
     README_AUTHOR_NAME: str = "AI-README Bot"
     README_AUTHOR_EMAIL: str = "ai-readme@noreply.local"
+    README_TEMP_BRANCH_PREFIX: str = "ai-readme/"
+    README_MR_TITLE_PREFIX: str = "[AI-README]"
+    README_MR_AUTO_MERGE: bool = True
+    README_MR_AUTO_MERGE_REMOVE_BRANCH: bool = True
+    README_MR_DESCRIPTION: str = "Automated AI_README.md update. Safe to merge."
 
     # SonarQube（预留）
     SONARQUBE_URL: str = ""

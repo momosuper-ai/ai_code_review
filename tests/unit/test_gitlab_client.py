@@ -104,3 +104,167 @@ class TestFileExists:
         self._mock_client_ctx(client, resp)
         with pytest.raises(httpx.HTTPStatusError):
             await client.file_exists(1, "AI_README.md", "main")
+
+
+def _mock_httpx_method(client: GitLabClient, method: str, response: httpx.Response):
+    """替换 client._client 为 AsyncMock context manager，指定某个 HTTP 方法返回 response。"""
+    mock_httpx = MagicMock()
+    setattr(mock_httpx, method, AsyncMock(return_value=response))
+    mock_httpx.__aenter__ = AsyncMock(return_value=mock_httpx)
+    mock_httpx.__aexit__ = AsyncMock(return_value=None)
+    client._client = MagicMock(return_value=mock_httpx)
+    return mock_httpx
+
+
+class TestGetBranch:
+    @pytest.mark.asyncio
+    async def test_returns_protected_flag(self):
+        client = GitLabClient()
+        req = httpx.Request("GET", "http://x/api/v4/projects/1/repository/branches/main")
+        resp = httpx.Response(
+            200, request=req,
+            json={"name": "main", "protected": True, "commit": {"id": "abc"}},
+        )
+        _mock_httpx_method(client, "get", resp)
+        result = await client.get_branch(1, "main")
+        assert result["protected"] is True
+        assert result["commit"]["id"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_raises_on_404(self):
+        client = GitLabClient()
+        req = httpx.Request("GET", "http://x/api/v4/projects/1/repository/branches/gone")
+        resp = httpx.Response(404, request=req, text="not found")
+        _mock_httpx_method(client, "get", resp)
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_branch(1, "gone")
+
+
+class TestCreateBranch:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        client = GitLabClient()
+        req = httpx.Request("POST", "http://x/api/v4/projects/1/repository/branches")
+        resp = httpx.Response(201, request=req, json={"name": "ai-readme/x"})
+        _mock_httpx_method(client, "post", resp)
+        result = await client.create_branch(1, "ai-readme/x", ref="main")
+        assert result["name"] == "ai-readme/x"
+
+    @pytest.mark.asyncio
+    async def test_conflict_is_idempotent(self):
+        client = GitLabClient()
+        req = httpx.Request("POST", "http://x/api/v4/projects/1/repository/branches")
+        resp = httpx.Response(
+            400, request=req,
+            text='{"message":"Branch already exists"}',
+        )
+        _mock_httpx_method(client, "post", resp)
+        result = await client.create_branch(1, "ai-readme/x", ref="main")
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_other_400_raises(self):
+        client = GitLabClient()
+        req = httpx.Request("POST", "http://x/api/v4/projects/1/repository/branches")
+        resp = httpx.Response(
+            400, request=req,
+            text='{"message":"Invalid ref"}',
+        )
+        _mock_httpx_method(client, "post", resp)
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.create_branch(1, "ai-readme/x", ref="main")
+
+
+class TestDeleteBranch:
+    @pytest.mark.asyncio
+    async def test_success_returns_none(self):
+        client = GitLabClient()
+        req = httpx.Request("DELETE", "http://x/api/v4/projects/1/repository/branches/x")
+        resp = httpx.Response(204, request=req)
+        _mock_httpx_method(client, "delete", resp)
+        result = await client.delete_branch(1, "ai-readme/x")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_swallows_404(self):
+        client = GitLabClient()
+        req = httpx.Request("DELETE", "http://x/api/v4/projects/1/repository/branches/x")
+        resp = httpx.Response(404, request=req, text="not found")
+        _mock_httpx_method(client, "delete", resp)
+        # 不抛异常
+        await client.delete_branch(1, "gone")
+
+    @pytest.mark.asyncio
+    async def test_swallows_network_error(self):
+        client = GitLabClient()
+        mock_httpx = MagicMock()
+        mock_httpx.delete = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        mock_httpx.__aenter__ = AsyncMock(return_value=mock_httpx)
+        mock_httpx.__aexit__ = AsyncMock(return_value=None)
+        client._client = MagicMock(return_value=mock_httpx)
+        # 不抛异常
+        await client.delete_branch(1, "x")
+
+
+class TestCreateMergeRequest:
+    @pytest.mark.asyncio
+    async def test_returns_iid(self):
+        client = GitLabClient()
+        req = httpx.Request("POST", "http://x/api/v4/projects/1/merge_requests")
+        resp = httpx.Response(
+            201, request=req,
+            json={"iid": 42, "web_url": "http://x/mr/42"},
+        )
+        _mock_httpx_method(client, "post", resp)
+        result = await client.create_merge_request(
+            1, "ai-readme/x", "main", "[AI-README] test",
+        )
+        assert result["iid"] == 42
+
+
+class TestAcceptMergeRequest:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        client = GitLabClient()
+        req = httpx.Request("PUT", "http://x/api/v4/projects/1/merge_requests/42/merge")
+        resp = httpx.Response(200, request=req, json={"state": "merged"})
+        _mock_httpx_method(client, "put", resp)
+        result = await client.accept_merge_request(1, 42)
+        assert result["state"] == "merged"
+
+    @pytest.mark.asyncio
+    async def test_handles_406(self):
+        """pipeline 未通过返回 406 时降级为 warning，返回空 dict。"""
+        client = GitLabClient()
+        req = httpx.Request("PUT", "http://x/api/v4/projects/1/merge_requests/42/merge")
+        resp = httpx.Response(406, request=req, text="not acceptable")
+        _mock_httpx_method(client, "put", resp)
+        result = await client.accept_merge_request(1, 42)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_handles_405(self):
+        client = GitLabClient()
+        req = httpx.Request("PUT", "http://x/api/v4/projects/1/merge_requests/42/merge")
+        resp = httpx.Response(405, request=req, text="method not allowed")
+        _mock_httpx_method(client, "put", resp)
+        result = await client.accept_merge_request(1, 42)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_handles_409(self):
+        client = GitLabClient()
+        req = httpx.Request("PUT", "http://x/api/v4/projects/1/merge_requests/42/merge")
+        resp = httpx.Response(409, request=req, text="conflict")
+        _mock_httpx_method(client, "put", resp)
+        result = await client.accept_merge_request(1, 42)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_other_errors_raise(self):
+        client = GitLabClient()
+        req = httpx.Request("PUT", "http://x/api/v4/projects/1/merge_requests/42/merge")
+        resp = httpx.Response(500, request=req, text="server error")
+        _mock_httpx_method(client, "put", resp)
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.accept_merge_request(1, 42)

@@ -288,3 +288,172 @@ class GitLabClient:
                 )
                 raise exc
             return resp.json()
+
+    async def get_branch(self, project_id: int, branch: str) -> dict:
+        """GET /projects/:id/repository/branches/:branch"""
+        encoded = quote(branch, safe="")
+        async with self._client() as c:
+            t0 = time.time()
+            resp = await c.get(
+                f"/projects/{project_id}/repository/branches/{encoded}"
+            )
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "GitLab API: GET 分支信息 项目=%d 分支=%s -> 状态码 %d (%.0f毫秒)",
+                project_id, branch, resp.status_code, duration_ms,
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "GitLab API 失败: GET 分支信息 项目=%d 分支=%s 状态码=%d 响应=%s",
+                    project_id, branch, resp.status_code, resp.text[:500],
+                )
+                raise exc
+            return resp.json()
+
+    async def create_branch(
+        self, project_id: int, branch: str, ref: str,
+    ) -> dict:
+        """POST /projects/:id/repository/branches?branch=...&ref=...
+
+        幂等：若分支已存在（400 + "already exists"），返回空 dict + info 日志。
+        """
+        async with self._client() as c:
+            t0 = time.time()
+            resp = await c.post(
+                f"/projects/{project_id}/repository/branches",
+                params={"branch": branch, "ref": ref},
+            )
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "GitLab API: POST 创建分支 项目=%d 分支=%s ref=%s -> 状态码 %d (%.0f毫秒)",
+                project_id, branch, ref, resp.status_code, duration_ms,
+            )
+            if resp.status_code == 400 and "already exists" in resp.text.lower():
+                logger.info(
+                    "GitLab API: 分支已存在，视为幂等: 项目=%d 分支=%s",
+                    project_id, branch,
+                )
+                return {}
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "GitLab API 失败: POST 创建分支 项目=%d 分支=%s 状态码=%d 响应=%s",
+                    project_id, branch, resp.status_code, resp.text[:500],
+                )
+                raise exc
+            return resp.json()
+
+    async def delete_branch(self, project_id: int, branch: str) -> None:
+        """DELETE /projects/:id/repository/branches/:branch
+
+        清理失败不抛异常，仅记录 warning。
+        """
+        encoded = quote(branch, safe="")
+        async with self._client() as c:
+            t0 = time.time()
+            try:
+                resp = await c.delete(
+                    f"/projects/{project_id}/repository/branches/{encoded}"
+                )
+            except Exception:
+                logger.warning(
+                    "GitLab API: DELETE 分支网络异常 项目=%d 分支=%s",
+                    project_id, branch, exc_info=True,
+                )
+                return
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "GitLab API: DELETE 分支 项目=%d 分支=%s -> 状态码 %d (%.0f毫秒)",
+                project_id, branch, resp.status_code, duration_ms,
+            )
+            if resp.status_code >= 300:
+                logger.warning(
+                    "GitLab API: DELETE 分支失败 项目=%d 分支=%s 状态码=%d 响应=%s",
+                    project_id, branch, resp.status_code, resp.text[:300],
+                )
+
+    async def create_merge_request(
+        self,
+        project_id: int,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+        description: str = "",
+        remove_source_branch: bool = True,
+        squash: bool = True,
+    ) -> dict:
+        """POST /projects/:id/merge_requests"""
+        payload = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "title": title,
+            "description": description,
+            "remove_source_branch": remove_source_branch,
+            "squash": squash,
+        }
+        async with self._client() as c:
+            t0 = time.time()
+            resp = await c.post(
+                f"/projects/{project_id}/merge_requests",
+                json=payload,
+            )
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "GitLab API: POST 创建合并请求 项目=%d %s->%s -> 状态码 %d (%.0f毫秒)",
+                project_id, source_branch, target_branch,
+                resp.status_code, duration_ms,
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "GitLab API 失败: POST 创建合并请求 项目=%d 状态码=%d 响应=%s",
+                    project_id, resp.status_code, resp.text[:500],
+                )
+                raise exc
+            return resp.json()
+
+    async def accept_merge_request(
+        self,
+        project_id: int,
+        mr_iid: int,
+        should_remove_source_branch: bool = True,
+        merge_when_pipeline_succeeds: bool = False,
+    ) -> dict:
+        """PUT /projects/:id/merge_requests/:iid/merge
+
+        405/406/409（冲突、未就绪、需审批）仅 warning 并返回空 dict，由上层决定降级。
+        """
+        payload = {
+            "should_remove_source_branch": should_remove_source_branch,
+            "merge_when_pipeline_succeeds": merge_when_pipeline_succeeds,
+        }
+        async with self._client() as c:
+            t0 = time.time()
+            resp = await c.put(
+                f"/projects/{project_id}/merge_requests/{mr_iid}/merge",
+                json=payload,
+            )
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "GitLab API: PUT 接受合并请求 项目=%d MR=%d -> 状态码 %d (%.0f毫秒)",
+                project_id, mr_iid, resp.status_code, duration_ms,
+            )
+            if resp.status_code in (405, 406, 409):
+                logger.warning(
+                    "GitLab API: 自动合并未就绪 项目=%d MR=%d 状态码=%d 响应=%s",
+                    project_id, mr_iid, resp.status_code, resp.text[:300],
+                )
+                return {}
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "GitLab API 失败: PUT 接受合并请求 项目=%d MR=%d 状态码=%d 响应=%s",
+                    project_id, mr_iid, resp.status_code, resp.text[:500],
+                )
+                raise exc
+            return resp.json()
