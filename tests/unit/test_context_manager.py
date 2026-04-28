@@ -12,6 +12,7 @@ from src.core.context_manager import (
     _summarize_tool_result,
     estimate_message_tokens,
     estimate_tokens,
+    normalize_message,
     trim_messages,
 )
 
@@ -49,12 +50,36 @@ def _make_assistant_text(content: str = "Here is my review.") -> dict:
 
 
 def _make_chat_completion_message(content=None, tool_calls=None):
-    """Create a mock ChatCompletionMessage object."""
+    """Create a mock ChatCompletionMessage object (with working model_dump)."""
+    dumped_tool_calls = None
+    if tool_calls:
+        dumped_tool_calls = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in tool_calls
+        ]
+
     msg = MagicMock()
     msg.role = "assistant"
     msg.content = content
     msg.tool_calls = tool_calls
     msg.tool_call_id = None
+
+    def _model_dump(exclude_none=True):
+        data = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": dumped_tool_calls,
+            "tool_call_id": None,
+        }
+        if exclude_none:
+            data = {k: v for k, v in data.items() if v is not None}
+        return data
+
+    msg.model_dump = _model_dump
     return msg
 
 
@@ -87,6 +112,84 @@ class TestEstimateTokens:
         text = "a" * 300
         # 300 / 3.0 = 100
         assert estimate_tokens(text) == 100
+
+
+# ---------------------------------------------------------------------------
+# normalize_message — 无损保留模型特定字段（如 DeepSeek reasoning_content）
+# ---------------------------------------------------------------------------
+
+class TestNormalizeMessage:
+    def test_dict_is_deep_copied(self):
+        msg = {"role": "user", "content": "hi", "custom": {"nested": 1}}
+        result = normalize_message(msg)
+        assert result == msg
+        # 深拷贝：修改结果不影响原始
+        result["custom"]["nested"] = 999
+        assert msg["custom"]["nested"] == 1
+
+    def test_preserves_reasoning_content_for_pydantic_v2(self):
+        """DeepSeek thinking 模式返回的 reasoning_content 必须被保留。"""
+
+        class FakeMsg:
+            def model_dump(self, exclude_none=True):
+                data = {
+                    "role": "assistant",
+                    "content": "final answer",
+                    "reasoning_content": "step-by-step thinking...",
+                    "tool_calls": None,
+                }
+                if exclude_none:
+                    data = {k: v for k, v in data.items() if v is not None}
+                return data
+
+        result = normalize_message(FakeMsg())
+        assert result["reasoning_content"] == "step-by-step thinking..."
+        assert result["content"] == "final answer"
+        assert "tool_calls" not in result
+
+    def test_preserves_thinking_field(self):
+        """Claude extended thinking 的 thinking 字段也能自动保留。"""
+
+        class FakeMsg:
+            def model_dump(self, exclude_none=True):
+                return {
+                    "role": "assistant",
+                    "content": "answer",
+                    "thinking": [{"type": "thinking", "text": "..."}],
+                }
+
+        result = normalize_message(FakeMsg())
+        assert result["thinking"] == [{"type": "thinking", "text": "..."}]
+
+    def test_pydantic_v1_fallback(self):
+        """pydantic v1 模型走 .dict() 分支。"""
+
+        class FakeMsgV1:
+            def dict(self, exclude_none=True):
+                return {"role": "assistant", "content": "v1", "reasoning_content": "r"}
+
+        result = normalize_message(FakeMsgV1())
+        assert result["reasoning_content"] == "r"
+
+    def test_unsupported_type_raises(self):
+        with pytest.raises(TypeError):
+            normalize_message("plain string")
+
+
+class TestCopyMessagePreservesExtraFields:
+    def test_copy_message_preserves_reasoning_content(self):
+        """_copy_message 走 normalize_message，reasoning_content 不丢。"""
+
+        class FakeMsg:
+            def model_dump(self, exclude_none=True):
+                return {
+                    "role": "assistant",
+                    "content": "c",
+                    "reasoning_content": "r",
+                }
+
+        result = _copy_message(FakeMsg())
+        assert result["reasoning_content"] == "r"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """vLLM client using OpenAI-compatible API with tool calling support."""
 
 import asyncio
+import json
 import random
 import time
 from dataclasses import dataclass
@@ -68,10 +69,18 @@ class LLMClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 8192,
+        max_tokens: int | None = None,
+        response_format: dict | None = None,
     ) -> ChatResult:
-        """Send a chat completion request, optionally with tools."""
+        """Send a chat completion request, optionally with tools.
+
+        max_tokens 为 None 时使用 settings.LLM_MAX_TOKENS。
+        response_format: 如 {"type": "json_object"}，仅在 tools=None 最终输出阶段建议启用。
+        """
         from src.core.context_manager import trim_messages
+
+        if max_tokens is None:
+            max_tokens = settings.LLM_MAX_TOKENS
 
         messages = trim_messages(messages, reserve_for_completion=max_tokens)
 
@@ -88,6 +97,17 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+
+        # 模型特性透传（thinking / reasoning_effort 等，由 .env 配置）
+        if settings.LLM_EXTRA_BODY:
+            try:
+                extra_body = json.loads(settings.LLM_EXTRA_BODY)
+                if isinstance(extra_body, dict):
+                    kwargs["extra_body"] = extra_body
+            except json.JSONDecodeError:
+                logger.warning("LLM_EXTRA_BODY 解析失败，忽略: %s", settings.LLM_EXTRA_BODY)
 
         max_retries = settings.LLM_RETRY_MAX
 
@@ -117,6 +137,13 @@ class LLMClient:
                     f"{usage.prompt_tokens}+{usage.completion_tokens}(cached:{cached})" if usage else "无",
                     duration_ms,
                 )
+                # 截断预警：completion 达到 max_tokens 95% 说明输出可能未写完（常见 JSON 语法错诱因）
+                if usage and usage.completion_tokens >= int(max_tokens * 0.95):
+                    finish = getattr(response.choices[0], "finish_reason", None)
+                    logger.warning(
+                        "LLM 输出可能被截断: completion=%d ≥ 95%% of max_tokens=%d, finish_reason=%s",
+                        usage.completion_tokens, max_tokens, finish,
+                    )
                 return ChatResult(message=response.choices[0].message, usage=call_usage)
             except Exception as exc:
                 if attempt < max_retries and self._is_retryable(exc):

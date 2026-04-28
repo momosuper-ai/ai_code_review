@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     LLM_RETRY_BASE_DELAY: float = 2.0         # 基础退避秒数
     LLM_RETRY_MAX_DELAY: float = 30.0         # 最大退避秒数
 
+    # LLM 最大输出 token（chat() max_tokens=None 时使用此默认值）
+    # 8192 兼顾大多数云端模型默认上限；过低会导致长 JSON 被截断 → 解析失败
+    LLM_MAX_TOKENS: int = 256000
+
+    # LLM 扩展参数透传（JSON 字符串，原样作为 OpenAI SDK 的 extra_body 下发）
+    # 用于主动控制 thinking/reasoning 等模型特性。示例：
+    #   关闭 DeepSeek thinking:   '{"thinking": {"type": "disabled"}}'
+    #   启用预算型 thinking:       '{"thinking": {"type": "enabled", "budget_tokens": 2048}}'
+    #   OpenAI reasoning_effort:  '{"reasoning_effort": "low"}'
+    LLM_EXTRA_BODY: str = ""
+
     # 上下文长度管理
     LLM_MAX_CONTEXT_TOKENS: int = 256000       # 模型最大上下文 token 数
     LLM_CONTEXT_THRESHOLD: float = 0.9         # 触发裁剪的阈值（0.9 = 230,400 tokens）

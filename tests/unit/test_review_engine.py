@@ -63,11 +63,12 @@ class TestTryParse:
         assert err_type == "no_json"
 
     def test_json_syntax_error(self):
-        content = '{"overall_assessment": "ok", "score": "A",}'  # trailing comma
+        # 配平 `{...}` 但内部彻底不像 JSON，json_repair 也无法修复成 dict
+        content = '{this is not json at all !!! @#$%}'
         result, err_type, err_detail = ReviewEngine._try_parse(content)
         assert result is None
-        assert err_type == "json_syntax_error"
-        assert err_detail  # should contain JSONDecodeError message
+        assert err_type in ("json_syntax_error", "missing_fields")
+        assert err_detail
 
     def test_missing_fields_overall_assessment(self):
         content = json.dumps({"issues": [], "score": "B"})
@@ -96,6 +97,58 @@ class TestTryParse:
         result, _, _ = ReviewEngine._try_parse(content)
         assert result is not None
         assert result.score == "A"
+
+    def test_thinking_wrapper_with_brace_inside(self):
+        """thinking 标签内含 `{` 不应被误抓为 JSON 起点。"""
+        content = (
+            "<think>let me analyze this { example } carefully</think>\n"
+            '{"overall_assessment": "ok", "score": "A"}'
+        )
+        result, err_type, _ = ReviewEngine._try_parse(content)
+        assert result is not None
+        assert result.score == "A"
+
+    def test_multiple_braces_in_preamble(self):
+        """preamble 中的孤立 `{` 后才出现真 JSON。"""
+        content = (
+            "Looking at code: {b == 0} is the check.\n"
+            "Now my analysis result:\n"
+            '{"overall_assessment": "Found a bug", "score": "C"}'
+        )
+        result, _, _ = ReviewEngine._try_parse(content)
+        assert result is not None
+        assert result.score == "C"
+
+    def test_brace_inside_string_literal(self):
+        """JSON 字符串字面量中的 `}` 不应导致提前结束。"""
+        content = (
+            '{"overall_assessment": "代码有问题: } 漏掉了", "score": "B"}'
+        )
+        result, _, _ = ReviewEngine._try_parse(content)
+        assert result is not None
+        assert "漏掉了" in result.overall_assessment
+
+    def test_thinking_plus_markdown_wrapped_json(self):
+        """thinking + markdown 包装的 JSON 都能识别。"""
+        content = (
+            "<thinking>The diff shows a fix.</thinking>\n"
+            "```json\n"
+            '{"overall_assessment": "Good fix", "score": "B"}\n'
+            "```"
+        )
+        result, _, _ = ReviewEngine._try_parse(content)
+        assert result is not None
+        assert result.score == "B"
+
+    def test_two_json_objects_takes_first(self):
+        """两个 JSON 对象只取第一个完整闭合的。"""
+        content = (
+            '{"overall_assessment": "first", "score": "A"}\n'
+            'And another: {"overall_assessment": "second", "score": "D"}'
+        )
+        result, _, _ = ReviewEngine._try_parse(content)
+        assert result is not None
+        assert result.overall_assessment == "first"
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +328,78 @@ class TestParseWithRetry:
         retry_msgs = call_args[0][0] if call_args[0] else call_args[1]["messages"]
         user_msg = [m for m in retry_msgs if isinstance(m, dict) and m.get("role") == "user"]
         assert any("bug" in m.get("content", "") for m in user_msg)
+
+    @pytest.mark.asyncio
+    async def test_original_response_reasoning_content_passed_back(self, mock_llm):
+        """传入 original_response 时，重试消息中 assistant 条目应带 reasoning_content。
+
+        场景：DeepSeek thinking 模式要求后续轮次必须回传 reasoning_content。
+        """
+        bad_content = "no json here"
+        good_json = json.dumps({
+            "overall_assessment": "ok", "score": "B",
+            "issues": [], "highlights": [],
+        })
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content=good_json))
+
+        class FakeResponse:
+            def model_dump(self, exclude_none=True):
+                return {
+                    "role": "assistant",
+                    "content": bad_content,
+                    "reasoning_content": "<think>let me analyze</think>",
+                }
+
+        await _parse_with_retry(
+            mock_llm, bad_content, [], tag="",
+            original_response=FakeResponse(),
+        )
+
+        call_args = mock_llm.chat.call_args
+        retry_msgs = call_args[0][0] if call_args[0] else call_args[1]["messages"]
+        assistant_msgs = [
+            m for m in retry_msgs if isinstance(m, dict) and m.get("role") == "assistant"
+        ]
+        assert assistant_msgs, "retry_messages 应包含 assistant 消息"
+        assert assistant_msgs[-1].get("reasoning_content") == "<think>let me analyze</think>"
+
+    @pytest.mark.asyncio
+    async def test_failed_content_is_dumped_to_file(self, mock_llm, tmp_path, monkeypatch):
+        """解析失败时调用 _dump_failed_content 落盘。"""
+        from src.core import review_engine as re_mod
+        monkeypatch.setattr(re_mod, "_FAILED_DUMP_DIR", str(tmp_path))
+
+        bad_content = "no json at all"
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content="still bad"))
+        with patch("src.core.review_engine.settings") as mock_settings:
+            mock_settings.AGENT_FORMAT_RETRY_MAX = 1
+            await _parse_with_retry(
+                mock_llm, bad_content, [], tag="[review:42][security] ",
+            )
+        files = list(tmp_path.iterdir())
+        assert len(files) >= 1
+        assert any("42" in f.name and "security" in f.name for f in files)
+
+    @pytest.mark.asyncio
+    async def test_without_original_response_falls_back_to_content_only(self, mock_llm):
+        """向后兼容：不传 original_response 时仍用 content-only dict。"""
+        bad_content = "no json"
+        good_json = json.dumps({
+            "overall_assessment": "ok", "score": "B",
+            "issues": [], "highlights": [],
+        })
+        mock_llm.chat = AsyncMock(return_value=_make_chat_result(content=good_json))
+
+        await _parse_with_retry(mock_llm, bad_content, [], tag="")
+
+        call_args = mock_llm.chat.call_args
+        retry_msgs = call_args[0][0] if call_args[0] else call_args[1]["messages"]
+        assistant_msgs = [
+            m for m in retry_msgs if isinstance(m, dict) and m.get("role") == "assistant"
+        ]
+        assert assistant_msgs
+        assert set(assistant_msgs[-1].keys()) == {"role", "content"}
+        assert assistant_msgs[-1]["content"] == bad_content
 
 
 # ---------------------------------------------------------------------------

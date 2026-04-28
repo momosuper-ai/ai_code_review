@@ -242,6 +242,8 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 
 - **重试机制**: 指数退避 `base_delay * 2^attempt + random()`，可重试异常: RateLimitError、APIConnectionError、HTTP 500/502/503/529，最多 `LLM_RETRY_MAX` 次
 - **上下文管理**: `chat()` 每次调用前自动 `trim_messages()`，预算 = `LLM_MAX_CONTEXT_TOKENS × LLM_CONTEXT_THRESHOLD - max_tokens`
+- **消息无损归一化**: 任何 pydantic `ChatCompletionMessage` 入消息列表前都经 `context_manager.normalize_message()` 统一转 dict（`model_dump(exclude_none=True)`），无损保留 `reasoning_content`（DeepSeek thinking）、`thinking`（Claude extended thinking）等模型特定字段；`_parse_with_retry` 重试时保留原始 response 而非仅 content，确保"需要把字段回传给下一轮"的模型（如 DeepSeek v3.2+）不会 400
+- **模型特性透传**: `LLM_EXTRA_BODY`（JSON 字符串）作为 OpenAI SDK 的 `extra_body` 下发，用于切换模型时主动控制 thinking/reasoning_effort 等参数，避免每换一个模型就改代码
 
 ## 部署注意事项
 
@@ -367,6 +369,7 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | `LLM_RETRY_MAX` | `3` | 最大重试次数 |
 | `LLM_RETRY_BASE_DELAY` | `2.0` | 基础退避秒数 |
 | `LLM_RETRY_MAX_DELAY` | `30.0` | 最大退避秒数 |
+| `LLM_EXTRA_BODY` | `""` | OpenAI SDK `extra_body` JSON 透传（thinking/reasoning_effort 等） |
 
 ### 上下文管理
 | 配置项 | 默认值 | 说明 |

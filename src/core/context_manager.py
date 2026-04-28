@@ -48,9 +48,25 @@ def trim_messages(
     reserve_for_completion: int = 8192,
 ) -> list[dict]:
     """裁剪消息列表使其不超过上下文窗口限制。返回新列表，不修改原始 messages。"""
-    budget = int(
+    raw_budget = int(
         settings.LLM_MAX_CONTEXT_TOKENS * settings.LLM_CONTEXT_THRESHOLD
     ) - reserve_for_completion
+
+    # 防御：reserve_for_completion(=max_tokens) 配错导致预算 ≤ 0 时，
+    # 强制将输入预算夹在 max_context 的 10% 处，避免出现"截断到负 tokens"的退化逻辑
+    min_budget = max(1024, int(settings.LLM_MAX_CONTEXT_TOKENS * 0.1))
+    if raw_budget < min_budget:
+        logger.error(
+            "LLM 上下文预算异常 (raw=%d)：reserve_for_completion=%d 接近或超过 "
+            "LLM_MAX_CONTEXT_TOKENS=%d × threshold=%.2f，已临时夹到 %d。"
+            "请检查 LLM_MAX_TOKENS 配置（应为输出上限，远小于 LLM_MAX_CONTEXT_TOKENS）",
+            raw_budget, reserve_for_completion,
+            settings.LLM_MAX_CONTEXT_TOKENS, settings.LLM_CONTEXT_THRESHOLD,
+            min_budget,
+        )
+        budget = min_budget
+    else:
+        budget = raw_budget
 
     total = sum(estimate_message_tokens(m) for m in messages)
     if total <= budget:
@@ -117,47 +133,35 @@ def _log_trim_done(trimmed: list[dict], original: list[dict]) -> None:
 # Message conversion helpers
 # ---------------------------------------------------------------------------
 
+def normalize_message(message) -> dict:
+    """将消息无损转为 dict（pydantic → dict 保留所有非 None 字段）。
+
+    用于消息入列表前的统一归一化，确保模型特定字段（如 DeepSeek 的
+    reasoning_content、Claude 的 thinking）不会在后续转换中丢失。
+    """
+    if isinstance(message, dict):
+        return copy.deepcopy(message)
+    if hasattr(message, "model_dump"):
+        return message.model_dump(exclude_none=True)  # pydantic v2
+    if hasattr(message, "dict"):
+        return message.dict(exclude_none=True)  # pydantic v1 fallback
+    raise TypeError(f"Cannot normalize message of type {type(message)}")
+
+
 def _as_dict(message) -> dict:
-    """将消息转为 dict 供读取（不拷贝）。"""
+    """将消息转为 dict 供读取（不深拷贝）。"""
     if isinstance(message, dict):
         return message
-    # ChatCompletionMessage 对象
-    result = {"role": getattr(message, "role", "assistant")}
-    if message.content is not None:
-        result["content"] = message.content
-    if getattr(message, "tool_calls", None):
-        result["tool_calls"] = message.tool_calls
-    if getattr(message, "tool_call_id", None):
-        result["tool_call_id"] = message.tool_call_id
-    return result
+    if hasattr(message, "model_dump"):
+        return message.model_dump(exclude_none=True)
+    if hasattr(message, "dict"):
+        return message.dict(exclude_none=True)
+    return {"role": "assistant"}
 
 
 def _copy_message(message) -> dict:
-    """将消息统一深拷贝为 dict 格式。"""
-    if isinstance(message, dict):
-        return copy.deepcopy(message)
-    # ChatCompletionMessage → dict
-    result: dict = {"role": getattr(message, "role", "assistant")}
-    if message.content is not None:
-        result["content"] = message.content
-    if getattr(message, "tool_call_id", None):
-        result["tool_call_id"] = message.tool_call_id
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        result["tool_calls"] = []
-        for tc in tool_calls:
-            if isinstance(tc, dict):
-                result["tool_calls"].append(copy.deepcopy(tc))
-            else:
-                result["tool_calls"].append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                })
-    return result
+    """将消息统一深拷贝为 dict 格式（无损保留模型特定字段）。"""
+    return normalize_message(message)
 
 
 # ---------------------------------------------------------------------------

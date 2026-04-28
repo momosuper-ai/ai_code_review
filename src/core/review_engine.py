@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
 
 from src.core.agent_tools import AgentToolExecutor
+from src.core.context_manager import normalize_message
 from src.core.llm_client import ChatResult, LLMClient, TokenUsage
 from src.config import settings
 from src.utils.logger import logger
@@ -67,6 +69,89 @@ _SKIP_PATH_PREFIXES = [
     "vendor/", "node_modules/", "dist/", "build/", ".git/",
     "__pycache__/", ".venv/", "venv/",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Robust JSON extraction (defends against thinking-wrapped / preamble outputs)
+# ---------------------------------------------------------------------------
+
+_THINKING_WRAPPERS = [
+    re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE),
+    re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
+    re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
+]
+
+
+def _strip_thinking(text: str) -> str:
+    """剥离常见 thinking/reasoning 包装标签后的内容。"""
+    for pat in _THINKING_WRAPPERS:
+        text = pat.sub("", text)
+    return text
+
+
+def _iter_balanced_objects(text: str):
+    """生成器：依次产出每个完整闭合的顶层 `{...}` 子串。
+
+    相比贪婪正则 `\\{[\\s\\S]*\\}`，正确处理：
+    - 字符串字面量内的 `{` / `}`（识别 `"..."` 并跳过 `\\` 转义）
+    - thinking/preamble 中的代码示例引发的"假大括号"
+
+    起点未配平时跳过该起点继续向后扫描。
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escape = False
+        end = -1
+        for j in range(i, n):
+            ch = text[j]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+        if end != -1:
+            yield text[i : end + 1]
+            i = end + 1
+        else:
+            i += 1
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    """提取第一个能解析为 JSON dict 的配平 `{...}` 子串。
+
+    多候选时跳过非 JSON 的"假对象"（如 preamble 中的 `{b == 0}`），
+    返回首个解析成功的对象。全部失败时返回最后一个候选交给上层
+    json_repair 兜底；无任何配平对象返回 None。
+    """
+    last_candidate: str | None = None
+    for raw in _iter_balanced_objects(text):
+        last_candidate = raw
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return raw
+    return last_candidate
+
 
 SYSTEM_PROMPT = """你是一位资深代码审查专家，负责对代码变更进行全面审查。
 
@@ -189,6 +274,36 @@ class DimensionResult:
 
 
 # ---------------------------------------------------------------------------
+# Failed LLM output dump (for diagnostics)
+# ---------------------------------------------------------------------------
+
+_FAILED_DUMP_DIR = "/data/logs/llm_parse_failed"
+
+
+def _dump_failed_content(content: str, tag: str, attempt: int, error_type: str) -> str | None:
+    """将解析失败的原始 LLM 输出落盘，便于事后排查。
+
+    文件名格式: {review_id}_{dimension}_a{attempt}_{error_type}_{timestamp}.txt
+    返回写入路径（成功）或 None（落盘失败/空内容，不阻塞主流程）。
+    """
+    if not content:
+        return None
+    try:
+        os.makedirs(_FAILED_DUMP_DIR, exist_ok=True)
+        rid_match = re.search(r"\[review:(\d+)\]", tag or "")
+        dim_match = re.search(r"\[(\w+)\]\s*$", (tag or "").strip())
+        rid = rid_match.group(1) if rid_match else "unknown"
+        dim = dim_match.group(1) if dim_match else "single"
+        filename = f"{rid}_{dim}_a{attempt}_{error_type}_{int(time.time())}.txt"
+        path = os.path.join(_FAILED_DUMP_DIR, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Module-level _parse_with_retry (shared by DimensionAgent and ReviewEngine)
 # ---------------------------------------------------------------------------
 
@@ -198,8 +313,15 @@ async def _parse_with_retry(
     messages: list[dict],
     tag: str = "",
     categories: list[str] | None = None,
+    original_response=None,
 ) -> tuple[ReviewResult, TokenUsage]:
-    """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。返回 (result, retry_usage)。"""
+    """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。返回 (result, retry_usage)。
+
+    original_response: 首次解析失败的完整 assistant 响应对象（pydantic
+    ChatCompletionMessage）。重试时会通过 normalize_message 无损回传，
+    确保 reasoning_content/thinking 等模型特定字段被保留 — DeepSeek
+    thinking mode 等模型要求后续轮次携带这些字段，否则 API 报 400。
+    """
     retry_usage = TokenUsage()
     result, error_type, error_detail = ReviewEngine._try_parse(content)
     if result is not None:
@@ -209,6 +331,7 @@ async def _parse_with_retry(
 
     max_retries = settings.AGENT_FORMAT_RETRY_MAX
     retry_messages = list(messages)  # shallow copy
+    last_response = original_response
     last_content = content
     retry_prompt_template = build_format_retry_prompt(categories)
 
@@ -217,12 +340,23 @@ async def _parse_with_retry(
         if "{detail}" in desc:
             desc = desc.format(detail=error_detail)
 
+        sample = (last_content or "")[:400].replace("\n", "\\n")
+        dump_path = _dump_failed_content(
+            content=last_content or "",
+            tag=tag,
+            attempt=attempt,
+            error_type=error_type,
+        )
         logger.warning(
-            "%s输出格式解析失败 (类型=%s)，开始第 %d/%d 次格式重试",
-            tag, error_type, attempt, max_retries,
+            "%s输出格式解析失败 (类型=%s 详情=%s 原长度=%d 首400字符=%r 完整落盘=%s)，开始第 %d/%d 次格式重试",
+            tag, error_type, error_detail, len(last_content or ""),
+            sample, dump_path or "未落盘", attempt, max_retries,
         )
 
-        retry_messages.append({"role": "assistant", "content": last_content})
+        if last_response is not None:
+            retry_messages.append(normalize_message(last_response))
+        else:
+            retry_messages.append({"role": "assistant", "content": last_content})
         retry_messages.append({
             "role": "user",
             "content": retry_prompt_template.format(
@@ -236,6 +370,7 @@ async def _parse_with_retry(
             chat_result = await llm.chat(
                 retry_messages, tools=None, temperature=temperature,
             )
+            last_response = chat_result.message
             last_content = chat_result.message.content or ""
             retry_usage += chat_result.usage
         except Exception:
@@ -302,6 +437,7 @@ class DimensionAgent:
                 result, retry_usage = await _parse_with_retry(
                     self.llm, content, messages, tag,
                     categories=self.dimension.categories,
+                    original_response=response,
                 )
                 dim_usage += retry_usage
                 return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
@@ -320,7 +456,7 @@ class DimensionAgent:
                     parsed_args_map[tc.id] = {}
                     tc.function.arguments = "{}"
 
-            messages.append(response)
+            messages.append(normalize_message(response))
             tool_outputs = []
             for tc in response.tool_calls:
                 args = parsed_args_map[tc.id]
@@ -363,11 +499,13 @@ class DimensionAgent:
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
         chat_result = await self.llm.chat(messages, tools=None)
-        content = chat_result.message.content or ""
+        final_response = chat_result.message
+        content = final_response.content or ""
         dim_usage += chat_result.usage
         result, retry_usage = await _parse_with_retry(
             self.llm, content, messages, tag,
             categories=self.dimension.categories,
+            original_response=final_response,
         )
         dim_usage += retry_usage
         return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
@@ -647,7 +785,9 @@ class ReviewEngine:
 
             if not response.tool_calls:
                 content = response.content or ""
-                result, retry_usage = await self._parse_with_retry(content, messages, tag)
+                result, retry_usage = await self._parse_with_retry(
+                    content, messages, tag, original_response=response,
+                )
                 agent_usage += retry_usage
                 result.tool_calls_count = total_tool_calls
                 result.total_prompt_tokens = agent_usage.prompt_tokens
@@ -673,7 +813,7 @@ class ReviewEngine:
                     parsed_args_map[tc.id] = {}
                     tc.function.arguments = "{}"
 
-            messages.append(response)
+            messages.append(normalize_message(response))
             tool_outputs = []
             for tc in response.tool_calls:
                 args = parsed_args_map[tc.id]
@@ -716,9 +856,12 @@ class ReviewEngine:
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
         chat_result = await self.llm.chat(messages, tools=None)
-        content = chat_result.message.content or ""
+        final_response = chat_result.message
+        content = final_response.content or ""
         agent_usage += chat_result.usage
-        result, retry_usage = await self._parse_with_retry(content, messages, tag)
+        result, retry_usage = await self._parse_with_retry(
+            content, messages, tag, original_response=final_response,
+        )
         agent_usage += retry_usage
         result.tool_calls_count = total_tool_calls
         result.total_prompt_tokens = agent_usage.prompt_tokens
@@ -935,19 +1078,46 @@ class ReviewEngine:
 
     @staticmethod
     def _try_parse(content: str) -> tuple[ReviewResult | None, str, str]:
-        """尝试解析 LLM 输出，返回 (result_or_None, error_type, error_detail)"""
-        cleaned = re.sub(r"```json\s*", "", content)
+        """尝试解析 LLM 输出，返回 (result_or_None, error_type, error_detail)。
+
+        标准 json.loads 失败时，回落到 json_repair 做本地修复
+        （尾逗号、未转义引号、字符串内换行、键无引号等），成功则不进入 LLM 重试。
+        """
+        # 1. 剥离 thinking/reasoning 包装（防止其内部 `{` 干扰）
+        cleaned = _strip_thinking(content)
+
+        # 2. 移除 markdown 代码块标记（兼容 ```json ... ``` 与 ``` ... ```）
+        cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"```\s*$", "", cleaned)
         cleaned = cleaned.strip()
 
-        json_match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not json_match:
-            return None, "no_json", "回复中未找到 JSON 对象"
+        # 3. 大括号配平栈提取第一个完整顶层 JSON 对象
+        raw = _extract_first_json_object(cleaned)
+        if raw is None:
+            return None, "no_json", "回复中未找到完整 JSON 对象"
 
+        data = None
         try:
-            data = json.loads(json_match.group())
-        except json.JSONDecodeError as e:
-            return None, "json_syntax_error", str(e)
+            data = json.loads(raw)
+        except json.JSONDecodeError as json_err:
+            try:
+                from json_repair import repair_json
+
+                repaired = repair_json(raw, return_objects=True)
+                if isinstance(repaired, dict):
+                    data = repaired
+                    logger.info(
+                        "JSON 本地修复成功，已跳过 LLM 重试 (原错误: %s)",
+                        str(json_err)[:120],
+                    )
+            except Exception as repair_err:
+                logger.debug("json_repair 修复失败: %s", repair_err)
+
+            if data is None:
+                return None, "json_syntax_error", str(json_err)
+
+        if not isinstance(data, dict):
+            return None, "json_syntax_error", f"解析结果非字典: {type(data).__name__}"
 
         required = {"overall_assessment", "score"}
         missing = required - set(data.keys())
@@ -957,21 +1127,22 @@ class ReviewEngine:
         return ReviewResult(
             overall_assessment=data.get("overall_assessment", ""),
             score=data.get("score", "B"),
-            issues=data.get("issues", []),
-            highlights=data.get("highlights", []),
+            issues=data.get("issues", []) or [],
+            highlights=data.get("highlights", []) or [],
         ), "", ""
 
     @staticmethod
     def _fallback_result(content: str) -> ReviewResult:
         """降级解析：尽力提取部分字段，否则使用原始文本。"""
-        cleaned = re.sub(r"```json\s*", "", content)
+        cleaned = _strip_thinking(content)
+        cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"```\s*$", "", cleaned)
         cleaned = cleaned.strip()
 
-        json_match = re.search(r"\{[\s\S]*\}", cleaned)
-        if json_match:
+        raw = _extract_first_json_object(cleaned)
+        if raw:
             try:
-                data = json.loads(json_match.group())
+                data = json.loads(raw)
                 return ReviewResult(
                     overall_assessment=data.get("overall_assessment", ""),
                     score=data.get("score", "B"),
@@ -993,9 +1164,13 @@ class ReviewEngine:
         content: str,
         messages: list[dict],
         tag: str = "",
+        original_response=None,
     ) -> tuple[ReviewResult, TokenUsage]:
         """实例方法代理，保持单Agent模式的兼容。"""
-        return await _parse_with_retry(self.llm, content, messages, tag)
+        return await _parse_with_retry(
+            self.llm, content, messages, tag,
+            original_response=original_response,
+        )
 
     @staticmethod
     def _parse_result(content: str) -> ReviewResult:
