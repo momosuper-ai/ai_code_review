@@ -36,6 +36,10 @@ class ChatResult:
     usage: TokenUsage
 
 
+# Sentinel：未传 response_format 时走自动决策；显式传 None 表示禁用；显式传 dict 表示透传
+_RESPONSE_FORMAT_AUTO = object()
+
+
 class LLMClient:
     def __init__(self, model_name: str | None = None):
         self._client = AsyncOpenAI(
@@ -70,14 +74,24 @@ class LLMClient:
         tools: list[dict] | None = None,
         temperature: float = 0.1,
         max_tokens: int | None = None,
-        response_format: dict | None = None,
+        response_format=_RESPONSE_FORMAT_AUTO,
+        json_schema_builder=None,
     ) -> ChatResult:
         """Send a chat completion request, optionally with tools.
 
         max_tokens 为 None 时使用 settings.LLM_MAX_TOKENS。
-        response_format: 如 {"type": "json_object"}，仅在 tools=None 最终输出阶段建议启用。
+
+        response_format 三态:
+          - 未传(默认 _RESPONSE_FORMAT_AUTO): 自动决策——有 tools 不挂；否则按
+            settings.response_format_mode_for(model) 决定挂 json_object/json_schema 或不挂
+          - None: 显式禁用（README 等 Markdown 输出场景）
+          - dict: 显式透传（测试/特殊调用）
+
+        json_schema_builder: callable 返回完整 {'type':'json_schema',...} dict，
+        仅在 mode=json_schema 自动决策时使用；缺失会降级为 json_object。
         """
         from src.core.context_manager import trim_messages
+        from src.core.dimensions import build_response_format
 
         if max_tokens is None:
             max_tokens = settings.LLM_MAX_TOKENS
@@ -97,8 +111,21 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        if response_format is not None:
-            kwargs["response_format"] = response_format
+
+        # 决定本次调用的 response_format
+        if response_format is _RESPONSE_FORMAT_AUTO:
+            if tools:
+                final_rf = None  # 工具循环阶段绝不挂 response_format
+            else:
+                mode = settings.response_format_mode_for(self._model)
+                final_rf = build_response_format(mode, json_schema_builder)
+        elif response_format is None:
+            final_rf = None  # 显式禁用
+        else:
+            final_rf = response_format  # 显式指定
+
+        if final_rf is not None:
+            kwargs["response_format"] = final_rf
 
         # 模型特性透传（thinking / reasoning_effort 等，由 .env 配置）
         if settings.LLM_EXTRA_BODY:
@@ -130,10 +157,11 @@ class LLMClient:
                     cached_tokens=cached,
                 )
                 logger.info(
-                    "LLM 调用: 模型=%s 消息数=%d 工具=%s token用量=%s (%.0f毫秒)",
+                    "LLM 调用: 模型=%s 消息数=%d 工具=%s rf=%s token用量=%s (%.0f毫秒)",
                     self._model,
                     len(messages),
                     "是" if tools else "否",
+                    (final_rf.get("type") if final_rf else "none"),
                     f"{usage.prompt_tokens}+{usage.completion_tokens}(cached:{cached})" if usage else "无",
                     duration_ms,
                 )

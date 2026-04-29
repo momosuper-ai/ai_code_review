@@ -26,4 +26,5 @@ class PushEvent(BaseModel):
     after: str
     total_commits_count: int
     user_name: str | None = None
+    user_username: str | None = None
     commits: list[dict] = []

@@ -203,7 +203,7 @@ class ReadmeGenerator:
             ),
         })
         chat_result = await self.llm.chat(
-            messages, tools=None,
+            messages, tools=None, response_format=None,
             max_tokens=settings.README_LLM_MAX_TOKENS,
         )
         usage += chat_result.usage
@@ -226,7 +226,7 @@ class ReadmeGenerator:
                 ),
             })
             chat_result = await self.llm.chat(
-                messages, tools=None,
+                messages, tools=None, response_format=None,
                 max_tokens=settings.README_LLM_MAX_TOKENS,
             )
             usage += chat_result.usage
@@ -243,7 +243,7 @@ class ReadmeGenerator:
             {"role": "user", "content": user_prompt},
         ]
         chat_result = await self.llm.chat(
-            messages, tools=None,
+            messages, tools=None, response_format=None,
             max_tokens=settings.README_LLM_MAX_TOKENS,
         )
         content = self._validate_content(chat_result.message.content or "")

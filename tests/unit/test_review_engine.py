@@ -1107,3 +1107,144 @@ class TestTokenUsage:
         )
         assert result.cloud_prompt_tokens == 1500
         assert result.local_prompt_tokens == 500
+
+
+# ---------------------------------------------------------------------------
+# response_format / json_schema_builder integration
+# ---------------------------------------------------------------------------
+class TestResponseFormatIntegration:
+    """验证终局调用与重试都带上对应的 json_schema_builder。"""
+
+    @pytest.mark.asyncio
+    async def test_parse_with_retry_forwards_schema_builder(self, monkeypatch):
+        """_parse_with_retry 重试时应把 json_schema_builder 透传给 chat。"""
+        from src.core.dimensions import build_single_agent_json_schema
+
+        monkeypatch.setattr("src.config.settings.AGENT_FORMAT_RETRY_MAX", 2)
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE", "json_object")
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE_CLOUD", "")
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE_LOCAL", "")
+        monkeypatch.setattr("src.config.settings.CLOUD_LLM_MODEL_NAME", "")
+
+        # 第 1 次重试返回合法 JSON 让循环结束
+        good = json.dumps({
+            "overall_assessment": "ok", "score": "A",
+            "issues": [], "highlights": [],
+        })
+        llm = MagicMock()
+        llm._model = "test-model"
+        llm.chat = AsyncMock(return_value=_make_chat_result(content=good))
+
+        result, _ = await _parse_with_retry(
+            llm, content="not a json", messages=[], tag="[review:1][bug] ",
+            json_schema_builder=build_single_agent_json_schema,
+        )
+        assert result is not None
+        # 验证 chat 被调用且带上了 json_schema_builder
+        assert llm.chat.await_count == 1
+        kwargs = llm.chat.await_args.kwargs
+        assert kwargs.get("json_schema_builder") is build_single_agent_json_schema
+
+    @pytest.mark.asyncio
+    async def test_parse_with_retry_no_builder_passes_none(self, monkeypatch):
+        """没有 schema_builder 时 chat 收到 json_schema_builder=None。"""
+        monkeypatch.setattr("src.config.settings.AGENT_FORMAT_RETRY_MAX", 1)
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE", "off")
+
+        good = json.dumps({
+            "overall_assessment": "ok", "score": "A",
+            "issues": [], "highlights": [],
+        })
+        llm = MagicMock()
+        llm._model = "test-model"
+        llm.chat = AsyncMock(return_value=_make_chat_result(content=good))
+
+        await _parse_with_retry(llm, content="bad", messages=[], tag="")
+        kwargs = llm.chat.await_args.kwargs
+        assert kwargs.get("json_schema_builder") is None
+
+    def test_dump_filename_includes_rf_mode(self, tmp_path, monkeypatch):
+        """落盘文件名应包含 rf_mode 段以便日志关联。"""
+        from src.core.review_engine import _dump_failed_content
+
+        monkeypatch.setattr("src.core.review_engine._FAILED_DUMP_DIR", str(tmp_path))
+        path = _dump_failed_content(
+            content="raw output",
+            tag="[review:42][bug] ",
+            attempt=1,
+            error_type="no_json",
+            rf_mode="json_object",
+        )
+        assert path is not None
+        assert "_a1_json_object_no_json_" in path
+
+    def test_dump_filename_default_rf_mode_none(self, tmp_path, monkeypatch):
+        """rf_mode 默认 'none' 段，向后兼容旧调用。"""
+        from src.core.review_engine import _dump_failed_content
+
+        monkeypatch.setattr("src.core.review_engine._FAILED_DUMP_DIR", str(tmp_path))
+        path = _dump_failed_content(
+            content="raw output",
+            tag="[review:42][security] ",
+            attempt=2,
+            error_type="missing_field",
+        )
+        assert path is not None
+        assert "_a2_none_missing_field_" in path
+
+    @pytest.mark.asyncio
+    async def test_parse_with_retry_first_success_skips_chat(self, monkeypatch):
+        """首次解析成功不调 chat，json_schema_builder 不应起作用。"""
+        from src.core.dimensions import build_single_agent_json_schema
+
+        good = json.dumps({
+            "overall_assessment": "ok", "score": "A",
+            "issues": [], "highlights": [],
+        })
+        llm = MagicMock()
+        llm._model = "test-model"
+        llm.chat = AsyncMock()
+
+        result, _ = await _parse_with_retry(
+            llm, content=good, messages=[], tag="",
+            json_schema_builder=build_single_agent_json_schema,
+        )
+        assert result is not None
+        assert llm.chat.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_parse_with_retry_warning_includes_rf(self, monkeypatch):
+        """warning 日志应包含 rf=... 字段。"""
+        import logging
+
+        monkeypatch.setattr("src.config.settings.AGENT_FORMAT_RETRY_MAX", 1)
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE", "json_object")
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE_CLOUD", "")
+        monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE_LOCAL", "")
+        monkeypatch.setattr("src.config.settings.CLOUD_LLM_MODEL_NAME", "")
+
+        good = json.dumps({
+            "overall_assessment": "ok", "score": "A",
+            "issues": [], "highlights": [],
+        })
+        llm = MagicMock()
+        llm._model = "test-model"
+        llm.chat = AsyncMock(return_value=_make_chat_result(content=good))
+
+        # 项目自定义 logger 关闭了 propagate，caplog 抓不到——直接挂 handler
+        captured = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        from src.utils.logger import logger as project_logger
+        sink = _Sink(level=logging.WARNING)
+        project_logger.addHandler(sink)
+        try:
+            await _parse_with_retry(llm, content="bad", messages=[], tag="")
+        finally:
+            project_logger.removeHandler(sink)
+
+        assert any("rf=json_object" in m for m in captured), \
+            f"Expected 'rf=json_object' in warning, got: {captured}"

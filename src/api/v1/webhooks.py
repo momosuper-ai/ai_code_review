@@ -188,6 +188,8 @@ def _handle_push(payload: dict) -> dict:
     project_id = project.get("id")
     after = payload.get("after", "")
     author = payload.get("user_name", "unknown")
+    # GitLab 用户名（用于 commit comment 中的 @mention，触发 GitLab 邮件通知给提交人）
+    author_username = payload.get("user_username") or ""
 
     # 抑制 MR merge 附带产生的 push 事件（短窗口 Redis 标记）
     if _is_mr_merge_dispatched(project_id, after):
@@ -197,9 +199,17 @@ def _handle_push(payload: dict) -> dict:
         )
         return {"status": "ignored", "reason": "suppressed by MR merge event"}
 
+    # 推送触发者诊断日志：对比 webhook 顶层 user_* 字段与 commits[0].author，便于排查 @mention 不准
+    head_author = (commits[0].get("author") or {}) if commits else {}
     logger.info(
-        "收到推送事件: 项目=%s 分支=%s before=%s after=%s",
+        "收到推送事件: 项目=%s 分支=%s before=%s after=%s "
+        "推送触发者[user_id=%s user_username=%s user_name=%s user_email=%s] "
+        "首个commit作者[name=%s email=%s] @mention将使用=%s",
         project_name, branch, before[:8], after[:8],
+        payload.get("user_id"), author_username or "<empty>",
+        payload.get("user_name"), payload.get("user_email"),
+        head_author.get("name"), head_author.get("email"),
+        f"@{author_username}" if author_username else "<跳过 @mention>",
     )
 
     from src.tasks.review_task import run_review
@@ -214,6 +224,7 @@ def _handle_push(payload: dict) -> dict:
         mr_iid=None,
         mr_title=None,
         before_sha=before,
+        author_username=author_username,
     )
 
     logger.info("已分发审查任务: task_id=%s 项目=%s", result.id, project_name)

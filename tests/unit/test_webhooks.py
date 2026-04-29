@@ -14,8 +14,9 @@ def _push_payload(
     before="a" * 40,
     after="b" * 40,
     total_commits=1,
+    user_username="dev_user",
 ):
-    return {
+    payload = {
         "ref": f"refs/heads/{branch}",
         "before": before,
         "after": after,
@@ -26,6 +27,9 @@ def _push_payload(
             "path_with_namespace": "group/repo",
         },
     }
+    if user_username is not None:
+        payload["user_username"] = user_username
+    return payload
 
 
 def _mr_payload(
@@ -80,6 +84,24 @@ class TestHandlePush:
         result = _handle_push(_push_payload(branch="ai-readme/1234-abc12345"))
         assert result["status"] == "ignored"
         assert result["reason"] == "ai_readme_temp_branch"
+
+    def test_user_username_passed_to_task(self):
+        """push 事件应将 user_username 作为 author_username 透传给 run_review。
+
+        审查完成后 commit comment 会用此字段在评论开头插入 @username，
+        触发 GitLab mention 邮件通知给提交人。
+        """
+        with patch("src.tasks.review_task.run_review") as mock_task:
+            mock_task.delay.return_value = MagicMock(id="task-u1")
+            _handle_push(_push_payload(branch="feature/foo", user_username="alice"))
+        assert mock_task.delay.call_args.kwargs["author_username"] == "alice"
+
+    def test_missing_user_username_passes_empty_string(self):
+        """payload 不带 user_username 时应透传空串（fail-open）。"""
+        with patch("src.tasks.review_task.run_review") as mock_task:
+            mock_task.delay.return_value = MagicMock(id="task-u2")
+            _handle_push(_push_payload(branch="feature/foo", user_username=None))
+        assert mock_task.delay.call_args.kwargs["author_username"] == ""
 
 
 class TestHandleMR:

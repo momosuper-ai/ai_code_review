@@ -280,10 +280,15 @@ class DimensionResult:
 _FAILED_DUMP_DIR = "/data/logs/llm_parse_failed"
 
 
-def _dump_failed_content(content: str, tag: str, attempt: int, error_type: str) -> str | None:
+_SAFE_RF_MODE_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _dump_failed_content(
+    content: str, tag: str, attempt: int, error_type: str, rf_mode: str = "none",
+) -> str | None:
     """将解析失败的原始 LLM 输出落盘，便于事后排查。
 
-    文件名格式: {review_id}_{dimension}_a{attempt}_{error_type}_{timestamp}.txt
+    文件名格式: {review_id}_{dimension}_a{attempt}_{rf_mode}_{error_type}_{timestamp}.txt
     返回写入路径（成功）或 None（落盘失败/空内容，不阻塞主流程）。
     """
     if not content:
@@ -294,7 +299,9 @@ def _dump_failed_content(content: str, tag: str, attempt: int, error_type: str) 
         dim_match = re.search(r"\[(\w+)\]\s*$", (tag or "").strip())
         rid = rid_match.group(1) if rid_match else "unknown"
         dim = dim_match.group(1) if dim_match else "single"
-        filename = f"{rid}_{dim}_a{attempt}_{error_type}_{int(time.time())}.txt"
+        # 防御性清理：rf_mode 可能是 MagicMock 等非字符串，避免 Windows 非法字符
+        safe_rf = _SAFE_RF_MODE_RE.sub("_", str(rf_mode))[:32] or "none"
+        filename = f"{rid}_{dim}_a{attempt}_{safe_rf}_{error_type}_{int(time.time())}.txt"
         path = os.path.join(_FAILED_DUMP_DIR, filename)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -314,6 +321,7 @@ async def _parse_with_retry(
     tag: str = "",
     categories: list[str] | None = None,
     original_response=None,
+    json_schema_builder=None,
 ) -> tuple[ReviewResult, TokenUsage]:
     """解析 LLM 输出，失败则重试引导 LLM 重新输出正确格式。返回 (result, retry_usage)。
 
@@ -321,6 +329,9 @@ async def _parse_with_retry(
     ChatCompletionMessage）。重试时会通过 normalize_message 无损回传，
     确保 reasoning_content/thinking 等模型特定字段被保留 — DeepSeek
     thinking mode 等模型要求后续轮次携带这些字段，否则 API 报 400。
+
+    json_schema_builder: callable 返回 schema dict，重试时透传给 chat() 维持
+    协议层强约束（用户选择"全程都带 schema"策略）。
     """
     retry_usage = TokenUsage()
     result, error_type, error_detail = ReviewEngine._try_parse(content)
@@ -334,6 +345,7 @@ async def _parse_with_retry(
     last_response = original_response
     last_content = content
     retry_prompt_template = build_format_retry_prompt(categories)
+    rf_mode = settings.response_format_mode_for(llm._model)
 
     for attempt in range(1, max_retries + 1):
         desc = _ERROR_TYPE_DESCRIPTIONS.get(error_type, error_detail)
@@ -346,11 +358,12 @@ async def _parse_with_retry(
             tag=tag,
             attempt=attempt,
             error_type=error_type,
+            rf_mode=rf_mode,
         )
         logger.warning(
-            "%s输出格式解析失败 (类型=%s 详情=%s 原长度=%d 首400字符=%r 完整落盘=%s)，开始第 %d/%d 次格式重试",
+            "%s输出格式解析失败 (类型=%s 详情=%s 原长度=%d rf=%s 首400字符=%r 完整落盘=%s)，开始第 %d/%d 次格式重试",
             tag, error_type, error_detail, len(last_content or ""),
-            sample, dump_path or "未落盘", attempt, max_retries,
+            rf_mode, sample, dump_path or "未落盘", attempt, max_retries,
         )
 
         if last_response is not None:
@@ -369,6 +382,7 @@ async def _parse_with_retry(
         try:
             chat_result = await llm.chat(
                 retry_messages, tools=None, temperature=temperature,
+                json_schema_builder=json_schema_builder,
             )
             last_response = chat_result.message
             last_content = chat_result.message.content or ""
@@ -411,7 +425,9 @@ class DimensionAgent:
 
     async def run(self, diff_prompt: str) -> DimensionResult:
         """执行该维度的完整 agent tool-calling 循环。"""
-        from src.core.dimensions import build_dimension_prompt
+        from src.core.dimensions import build_dimension_prompt, build_dimension_json_schema
+
+        schema_builder = lambda: build_dimension_json_schema(self.dimension)  # noqa: E731
 
         start_time = time.time()
         tag = f"[review:{self.review_id}][{self.dimension.name}] " if self.review_id else f"[{self.dimension.name}] "
@@ -438,6 +454,7 @@ class DimensionAgent:
                     self.llm, content, messages, tag,
                     categories=self.dimension.categories,
                     original_response=response,
+                    json_schema_builder=schema_builder,
                 )
                 dim_usage += retry_usage
                 return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
@@ -498,7 +515,9 @@ class DimensionAgent:
                 "role": "user",
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
-        chat_result = await self.llm.chat(messages, tools=None)
+        chat_result = await self.llm.chat(
+            messages, tools=None, json_schema_builder=schema_builder,
+        )
         final_response = chat_result.message
         content = final_response.content or ""
         dim_usage += chat_result.usage
@@ -506,6 +525,7 @@ class DimensionAgent:
             self.llm, content, messages, tag,
             categories=self.dimension.categories,
             original_response=final_response,
+            json_schema_builder=schema_builder,
         )
         dim_usage += retry_usage
         return self._to_dimension_result(result, tool_calls_count, start_time, dim_usage)
@@ -765,6 +785,8 @@ class ReviewEngine:
 
     async def _run_single_agent(self, changes: list[dict], review_id: int | None = None, blast_radius_context: str = "") -> ReviewResult:
         """原有单Agent逻辑，完整保留现有 run_review 行为。"""
+        from src.core.dimensions import build_single_agent_json_schema
+
         tag = f"[review:{review_id}] " if review_id else ""
         agent_usage = TokenUsage()
 
@@ -787,6 +809,7 @@ class ReviewEngine:
                 content = response.content or ""
                 result, retry_usage = await self._parse_with_retry(
                     content, messages, tag, original_response=response,
+                    json_schema_builder=build_single_agent_json_schema,
                 )
                 agent_usage += retry_usage
                 result.tool_calls_count = total_tool_calls
@@ -855,12 +878,15 @@ class ReviewEngine:
                 "role": "user",
                 "content": "请停止使用工具，直接输出你的最终审查结果（JSON 格式）。",
             })
-        chat_result = await self.llm.chat(messages, tools=None)
+        chat_result = await self.llm.chat(
+            messages, tools=None, json_schema_builder=build_single_agent_json_schema,
+        )
         final_response = chat_result.message
         content = final_response.content or ""
         agent_usage += chat_result.usage
         result, retry_usage = await self._parse_with_retry(
             content, messages, tag, original_response=final_response,
+            json_schema_builder=build_single_agent_json_schema,
         )
         agent_usage += retry_usage
         result.tool_calls_count = total_tool_calls
@@ -1165,11 +1191,13 @@ class ReviewEngine:
         messages: list[dict],
         tag: str = "",
         original_response=None,
+        json_schema_builder=None,
     ) -> tuple[ReviewResult, TokenUsage]:
         """实例方法代理，保持单Agent模式的兼容。"""
         return await _parse_with_retry(
             self.llm, content, messages, tag,
             original_response=original_response,
+            json_schema_builder=json_schema_builder,
         )
 
     @staticmethod

@@ -61,11 +61,13 @@ def run_review(
     mr_title: str | None = None,
     mr_action: str | None = None,
     before_sha: str | None = None,
+    author_username: str | None = None,
 ):
     """Main review task entry point."""
     logger.info(
-        "开始审查任务: 项目=%s 触发=%s 提交=%s",
+        "开始审查任务: 项目=%s 触发=%s 提交=%s 提交人=%s mention_username=%s",
         project_name, trigger_type, commit_sha[:8],
+        author, author_username or "<empty>",
     )
     task_start = time.time()
 
@@ -146,6 +148,7 @@ def run_review(
                     commit_sha=commit_sha,
                     comment_body=result["comment_body"],
                     review_id=review_id,
+                    author_username=author_username,
                 )
             )
         except Exception:
@@ -286,8 +289,14 @@ async def _post_comment_async(
     commit_sha: str,
     comment_body: str,
     review_id: int,
+    author_username: str | None = None,
 ) -> None:
-    """发送评论到 GitLab。"""
+    """发送评论到 GitLab。
+
+    push 链路在 commit comment 开头插入 `@username`，借助 GitLab mention 通知
+    机制把审查结果以邮件形式投递给提交人（GitLab 默认不会主动通知 commit 作者）。
+    MR 链路保持原状，依赖 GitLab 原生的 MR 评论邮件通知参与者。
+    """
     gitlab = GitLabClient()
     t0 = time.time()
     if trigger_type == "merge_request" and mr_iid:
@@ -295,7 +304,15 @@ async def _post_comment_async(
         logger.info("[review:%d] 评论已发布到 GitLab MR#%s (%.1f秒)",
                      review_id, mr_iid, time.time() - t0)
     else:
-        await gitlab.post_commit_comment(project_id, commit_sha, comment_body)
+        body = comment_body
+        if author_username:
+            body = f"@{author_username}\n\n{comment_body}"
+            logger.info("[review:%d] 评论将 @ 提交人 user=%s 触发邮件通知",
+                         review_id, author_username)
+        else:
+            logger.warning("[review:%d] push 评论无 author_username，跳过 @mention（fail-open）",
+                            review_id)
+        await gitlab.post_commit_comment(project_id, commit_sha, body)
         logger.info("[review:%d] 评论已发布到 GitLab 提交 %s (%.1f秒)",
                      review_id, commit_sha[:8], time.time() - t0)
 

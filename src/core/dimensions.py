@@ -242,3 +242,84 @@ def get_enabled_dimensions() -> list[ReviewDimension]:
     """根据 settings.enabled_dimensions 过滤返回启用的维度。"""
     enabled = settings.enabled_dimensions
     return [d for d in _DIMENSIONS if d.name in enabled]
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema builders for OpenAI strict response_format
+# ---------------------------------------------------------------------------
+
+_SEVERITY_ENUM = ["critical", "major", "minor", "info"]
+_SCORE_ENUM = ["A", "B", "C", "D"]
+_ALL_CATEGORIES = ["bug", "security", "performance", "maintainability", "style", "design"]
+
+
+def _build_review_schema(categories: list[str], schema_name: str) -> dict:
+    """构造 OpenAI strict 模式合规的 review 结果 schema。"""
+    issue_props = {
+        "file_path": {"type": "string"},
+        "line_start": {"type": ["integer", "null"]},
+        "line_end": {"type": ["integer", "null"]},
+        "severity": {"type": "string", "enum": _SEVERITY_ENUM},
+        "category": {"type": "string", "enum": list(categories)},
+        "content": {"type": "string"},
+        "suggestion": {"type": "string"},
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["overall_assessment", "score", "issues", "highlights"],
+                "properties": {
+                    "overall_assessment": {"type": "string"},
+                    "score": {"type": "string", "enum": _SCORE_ENUM},
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": list(issue_props.keys()),
+                            "properties": issue_props,
+                        },
+                    },
+                    "highlights": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    }
+
+
+def build_dimension_json_schema(dimension: ReviewDimension) -> dict:
+    """单维度终局输出 schema，category enum 仅含本维度允许的值。"""
+    return _build_review_schema(
+        categories=dimension.categories,
+        schema_name=f"review_{dimension.name}",
+    )
+
+
+def build_single_agent_json_schema() -> dict:
+    """单 Agent 模式终局输出 schema，category enum 含全维度值。"""
+    return _build_review_schema(
+        categories=_ALL_CATEGORIES,
+        schema_name="review_full",
+    )
+
+
+def build_response_format(mode: str, schema_builder=None) -> dict | None:
+    """根据模式返回 chat() 用的 response_format 参数。
+
+    mode: 'json_schema' / 'json_object' / 'off'
+    schema_builder: callable 返回完整 {'type':'json_schema',...} dict（仅 json_schema 模式用）
+    """
+    if mode == "off":
+        return None
+    if mode == "json_object":
+        return {"type": "json_object"}
+    if mode == "json_schema":
+        if schema_builder is None:
+            return {"type": "json_object"}
+        return schema_builder()
+    return None

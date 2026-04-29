@@ -11,41 +11,51 @@
 - **双模型架构**：本地 vLLM 负责隐私扫描，云端 LLM 负责代码审查（可选启用）
 - **代码图分析**：多语言 AST 解析构建代码图（Python/JS/TS/Java/Go），基于 diff hunk 精确定位变更函数，仅追溯受影响符号的依赖关系
 - **安全防护**：Webhook Token 验证、API Key 认证、IP 白名单、Redis 速率限制
-- **智能容错**：LLM 调用指数退避重试、上下文自动裁剪、JSON 格式重试纠正、降级 fallback 解析
-- **结果回写**：审查报告格式化为 Markdown 评论，自动发布到 GitLab
-- **AI_README 自动生成**（可选）：审查成功后链式触发，为项目根目录和主要子目录生成/更新 `AI_README.md` 文档；首次用 Agent 工具循环、后续用结构指纹 + 单次 LLM 调用增量更新；通过 GitLab Commits API 批量提交，`[AI-README]` 前缀 + Push 事件过滤双重防递归
+- **结构化输出强约束**：`chat()` 终局调用按 `LLM_RESPONSE_FORMAT_MODE_*` 自动注入 OpenAI `response_format` —— 三档可配 `json_schema`（OpenAI strict 兼容）/ `json_object`（默认，最兼容）/ `off`（向后兼容仅 prompt），从协议层杜绝 Markdown/纯文本误输出
+- **智能容错**：LLM 调用指数退避重试、上下文自动裁剪、JSON 格式重试全程透传 schema_builder、降级 fallback 解析、解析失败原文落盘（含 rf_mode 段便于关联）
+- **结果回写**：审查报告格式化为 Markdown 评论，自动发布到 GitLab；先持久化 DB 后发评论，评论失败不影响数据
+- **AI_README 自动生成**（可选）：仅在 push 到主分支 或 MR merge 到主分支 审查成功后链式触发；首次用 Agent 工具循环、后续用结构指纹 + 单次 LLM 调用增量更新；按 trigger_type 选择提交路径——push 直接 commit；merge 探测主分支 `protected` 字段，**受保护时走"临时分支 → create_commit → 自动 MR → 自动合并"绕过**；三层防递归（commit message 前缀 + 临时分支前缀 push 过滤 + 自动 MR 前缀过滤 + DB partial unique index）
 - **历史记录**：所有审查记录和问题明细持久化到 PostgreSQL，支持通过 API 查询
 - **异步处理**：基于 Celery + Redis 的异步任务队列，Webhook 即时响应不阻塞
 
 ## 系统架构
 
 ```
-GitLab Webhook (MR open/update/reopen/merge / Push)
+GitLab Webhook (MR action=merge / Push 任意分支)
        |
        v
   FastAPI 接收 Webhook
-  (Token验证 -> IP白名单 -> 速率限制 -> 解析事件 -> 过滤)
+  (Token验证 -> IP白名单 -> 速率限制 -> 三层防递归过滤)
        |
        v
-  Celery 异步任务队列
+  Celery 异步任务队列 (run_review)
        |
+       +-- 0. 入口去重: 查询近 30 分钟同 (project_id, commit_sha) 是否已有审查
        +-- 1. 克隆/更新本地代码库 (filelock 防并发)
-       +-- 2. 代码图增量更新 (AST 解析变更文件)
-       +-- 3. 获取代码变更 (GitLab API diff)
+       +-- 2. 代码图增量更新 (AST 解析变更文件; 首次全量, 后续增量)
+       +-- 3. 获取代码变更 (GitLab API: MR diff 或 commit compare)
        +-- 4. 过滤非代码文件
-       +-- 5. 隐私预扫描 (规则+LLM 混合检测敏感数据)
-       +-- 6. 多维度 Agent 并行审查
-       |      5个维度 Agent 并行分析 diff
-       |        <-> 调用6个沙箱工具查看上下文
-       |      每轮工具结果隐私扫描
-       |      输出结构化审查结果
-       +-- 7. 结果反脱敏 (占位符还原)
-       +-- 8. 跨维度去重 + 加权评分
-       +-- 9. 持久化审查记录到数据库
-       +-- 10. 格式化 Markdown 报告 -> 回写 GitLab 评论
-       +-- 11. （可选）链式触发 AI_README 文档生成任务
-                  ReadmeGenerator: 扫描子目录 -> 指纹比对 -> 生成/更新
-                    -> GitLab Commits API 批量提交（`[AI-README]` 前缀）
+       +-- 5. 影响面预分析 (基于 diff hunk 变更行精确定位受影响节点 → 注入 prompt)
+       +-- 6. 隐私预扫描 (规则+本地 LLM 混合, 含影响面文本; 仅双模型模式)
+       +-- 7. 多维度 Agent 并行审查 (默认) 或 单 Agent 模式
+       |      5 个维度 Agent 经 asyncio.gather + Semaphore 并发分析 diff
+       |        <-> 调用 6 个沙箱工具查看上下文
+       |        <-> 协议层强约束输出 (response_format=json_object/json_schema)
+       |      每轮工具结果批量隐私扫描
+       |      JSON 解析失败时多档重试 + 降级 fallback
+       +-- 8. 结果反脱敏 (占位符还原; 仅双模型模式)
+       +-- 9. 跨维度去重 + 加权评分 (任一 D 或 critical → 强制降至 C)
+       +-- 10. 持久化审查记录 + 问题明细 + token 统计到 PostgreSQL
+       +-- 11. 格式化 Markdown 报告 -> 回写 GitLab 评论 (评论失败不影响数据持久化)
+       +-- 12. (可选) 链式分发 generate_readme 任务到 readme 队列
+              触发条件: push 到主分支 或 MR merge 到主分支
+              ReadmeGenerator: 扫描子目录 -> 指纹比对 -> 首次 Agent 工具循环 / 增量单次调用
+                push 路径: 直接 create_commit 到主分支
+                merge 路径: 探测主分支 protected 字段
+                  - 未保护: 直接 create_commit
+                  - 受保护: 临时分支 (ai-readme/{ts}-{sha8}) -> create_commit
+                            -> create_merge_request -> (可选) accept_merge_request 自动合并
+              数据库 partial unique index 保证同一 commit 仅生成一次成功记录
 ```
 
 ## 环境要求
@@ -127,7 +137,8 @@ docker-compose up --build -d
 
 > **注**：sonarqube / sonar-db / gitlab-runner 为基础设施预留，尚未与应用代码集成。
 
-首次启动时，数据库表会自动创建，无需手动执行迁移。
+数据库迁移（在另一个终端，容器 postgres 启动后执行）
+docker-compose exec api alembic upgrade head
 
 ### 第四步：验证服务状态
 
@@ -228,20 +239,22 @@ Reviews API 通过 `X-API-Key` header 验证访问权限。
 
 ### Merge Request 事件
 
-- 触发 action：`open`（创建）、`update`（更新）、`reopen`（重新打开）、`merge`（合并）
+- **仅 `action == "merge"` 触发**（合并到主分支时审查最终代码）
+- `open` / `update` / `reopen` / `close` 等其他 action 一律忽略——精简为"merge 仅触发一次"严格语义，避免反复触发
 - 目标分支必须在 `MAIN_BRANCHES` 配置中
-- `open/update/reopen`：审查**源分支**代码，结果写入 MR 评论（预防性审查）
-- `merge`：审查**合并后**代码，结果写入 MR 评论（最终确认）
-
-以下情况**不会**触发：MR 关闭（close）、目标分支非主分支的 MR。
+- 触发后审查结果写入 MR 评论；同时设置 Redis 标记 (`mr_merge:{project_id}:{commit_sha}` TTL 300s) 抑制 GitLab 同步发送的目标分支 push 事件
+- **防递归过滤**：source_branch 以 `README_TEMP_BRANCH_PREFIX`（默认 `ai-readme/`）开头，**或** title 以 `README_MR_TITLE_PREFIX`（默认 `[AI-README]`）开头的 MR 一律忽略（防止"文档自动 MR → 触发审查"递归）
 
 ### Push 事件
 
-- **所有分支**的推送均触发（不限制主分支）
+- **任意分支**的推送均触发审查（不限制主分支；但 README 文档生成另有主分支限制）
 - 过滤条件：不是新建分支（before SHA 非全零）且包含至少一个 commit
-- **防递归**：若本次 push 的**所有** commit message 均以 `[AI-README]` 开头（来自文档自动提交），则直接忽略，防止文档生成 → push → 再生成的无限循环
+- **三层防递归过滤**（按顺序判定）：
+  1. 分支名以 `README_TEMP_BRANCH_PREFIX`（默认 `ai-readme/`）开头 → 忽略（受保护主分支 README 绕过流程产生）
+  2. 本次推送所有 commit message 均以 `[AI-README]` 开头 → 忽略（文档自动提交）
+  3. commit_sha 命中 MR merge 抑制标记（5 分钟内）→ 忽略（防止 merge + 同步 push 双触发）
 
-以下情况**不会**触发：新建分支的推送、无 commit 的推送、全部为 `[AI-README]` 标记的推送。
+以下情况**不会**触发：新建分支的推送、无 commit 的推送、命中任一防递归条件的推送。
 
 ## 审查报告说明
 
@@ -319,12 +332,17 @@ GET /api/v1/reviews?project_id=1&status=completed&page=1&page_size=20
       "status": "completed",
       "files_reviewed": 5,
       "issues_found": 3,
+      "total_prompt_tokens": 12340,
+      "total_completion_tokens": 4560,
+      "total_cached_tokens": 1280,
       "created_at": "2026-03-16T10:00:00",
       "completed_at": "2026-03-16T10:02:30"
     }
   ]
 }
 ```
+
+> **关于 token 字段**：`reviews` 表持久化 prompt/completion/cached token 用量，按维度 + 按模型（cloud/local）分别累加。详情接口同时返回每个 issue 的 `dimension` 字段，标记问题来自哪个维度 Agent。
 
 ### 审查详情
 
@@ -417,6 +435,22 @@ GET /api/v1/reviews/{review_id}
 | `LLM_RETRY_MAX` | `3` | 最大重试次数 |
 | `LLM_RETRY_BASE_DELAY` | `2.0` | 基础退避秒数 |
 | `LLM_RETRY_MAX_DELAY` | `30.0` | 最大退避秒数 |
+| `LLM_MAX_TOKENS` | `256000` | `chat()` 不传 max_tokens 时的输出上限；过低会导致长 JSON 被截断 |
+| `LLM_EXTRA_BODY` | `""` | OpenAI SDK `extra_body` JSON 透传（thinking/reasoning_effort 等模型特性） |
+
+### LLM 结构化输出（response_format）
+
+通过协议层强制约束 LLM 输出的 JSON 合规性，配合 prompt 大幅降低解析失败率。三档模式可配，默认 `json_object`（最兼容）。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LLM_RESPONSE_FORMAT_MODE` | `json_object` | 全局模式：`json_schema`（最强）/ `json_object`（默认）/ `off`（关闭） |
+| `LLM_RESPONSE_FORMAT_MODE_CLOUD` | `""` | 云端模型独立覆盖（空 = 跟随全局）；DeepSeek 系仅支持 `json_object` |
+| `LLM_RESPONSE_FORMAT_MODE_LOCAL` | `""` | 本地 vLLM 独立覆盖（空 = 跟随全局）；vLLM 0.8.5+ / Qwen 系可设 `json_schema` |
+
+> 工具调用循环阶段（`tools` 非空）一律不挂 response_format（与 tools 并存会冲突）；终局调用（`tools=None`）才注入。README 文档生成显式传 `response_format=None` 禁用，保证 Markdown 输出不被强制 JSON。
+>
+> 切换前可运行 `docker-compose exec api python scripts/probe_structured_output.py` 探测当前 endpoint 对各模式的支持情况，根据输出建议设置 LOCAL/CLOUD 覆盖。
 
 ### 上下文管理
 
@@ -441,6 +475,16 @@ GET /api/v1/reviews/{review_id}
 | `CODE_GRAPH_LANGUAGES` | `python,javascript,typescript,java,go` | 启用的语言列表 |
 | `CODE_GRAPH_MAX_FILES_FULL_SCAN` | `5000` | 全量扫描最大文件数 |
 
+### 影响面预注入
+
+审查开始前预计算变更文件的依赖关系（基于 diff hunk 变更行精确定位受影响节点的上游调用者/下游被调用者），将影响面文本注入 prompt 开头，让 Agent 从第一轮就理解变更的依赖拓扑。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `BLAST_RADIUS_PRE_INJECT` | `true` | 启用影响面预注入 |
+| `BLAST_RADIUS_MAX_ITEMS` | `30` | 预注入的最大符号数量 |
+| `BLAST_RADIUS_MAX_CHARS` | `4000` | 预注入文本的最大字符数（约 1300 tokens） |
+
 ### 云端 LLM（双模型模式）
 
 | 配置项 | 默认值 | 说明 |
@@ -463,7 +507,7 @@ GET /api/v1/reviews/{review_id}
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `README_GENERATION_ENABLED` | `false` | 功能总开关，`true` 时审查成功后链式触发文档生成 |
+| `README_GENERATION_ENABLED` | `false` | 功能总开关；`true` 时仅 push 到主分支 或 MR merge 到主分支 审查成功后链式触发 |
 | `README_MIN_CODE_LINES` | `200` | 子目录最小代码行数阈值（低于则跳过） |
 | `README_LLM_MAX_TOKENS` | `4096` | LLM 最大输出 token |
 | `README_AGENT_MAX_ROUNDS` | `8` | 首次生成 Agent 工具调用最大轮数 |
@@ -472,6 +516,18 @@ GET /api/v1/reviews/{review_id}
 | `README_COMMIT_MESSAGE_PREFIX` | `[AI-README]` | 提交信息前缀（防递归标识） |
 | `README_AUTHOR_NAME` | `AI-README Bot` | Git 提交作者名 |
 | `README_AUTHOR_EMAIL` | `ai-readme@noreply.local` | Git 提交作者邮箱 |
+
+#### 受保护主分支处理（仅 MR merge 链路）
+
+当主分支被 GitLab 设置为 protected 时，无法直接 commit。代码自动走"临时分支 → create_commit → create_merge_request → (可选) accept_merge_request 自动合并"绕过流程；相关分支前缀和 MR 标题前缀同时被 webhook 层识别忽略，防止递归。push 链路能成功 push 本身就意味着主分支未保护，因此无需此流程。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `README_TEMP_BRANCH_PREFIX` | `ai-readme/` | 临时分支前缀；webhook 层识别此前缀的 push 直接忽略 |
+| `README_MR_TITLE_PREFIX` | `[AI-README]` | 自动 MR 标题前缀；webhook 层识别此前缀的 MR 直接忽略 |
+| `README_MR_AUTO_MERGE` | `true` | 是否自动合并 AI-README MR（受保护分支场景） |
+| `README_MR_AUTO_MERGE_REMOVE_BRANCH` | `true` | 自动合并后是否删除临时源分支 |
+| `README_MR_DESCRIPTION` | `Automated AI_README.md update. Safe to merge.` | 自动 MR 的描述文案 |
 
 ## 运维指南
 
@@ -598,6 +654,8 @@ obc_ai_code_review/
 │       ├── security.py           # Webhook Token + API Key 认证
 │       ├── rate_limit.py         # Redis 固定窗口速率限制
 │       └── ip_whitelist.py       # IP 白名单中间件
+├── scripts/                     # 运维/探测脚本
+│   └── probe_structured_output.py  # 探测 endpoint 对 response_format 各模式的支持
 └── tests/                        # 测试
     └── unit/
         ├── test_agent_tools.py
@@ -605,10 +663,13 @@ obc_ai_code_review/
         ├── test_dimensions.py
         ├── test_privacy_filter.py
         ├── test_review_engine.py
+        ├── test_review_task.py
+        ├── test_readme_generator.py
+        ├── test_readme_task.py
+        ├── test_llm_client.py
         ├── test_webhooks.py
         ├── test_code_graph.py
-        ├── test_gitlab_client.py
-        └── test_readme_generator.py
+        └── test_gitlab_client.py
 ```
 
 ## 常见问题
@@ -685,4 +746,29 @@ docker-compose exec api alembic upgrade head   # 首次启用需确保 readme_re
 
 ### AI_README 生成后触发了新一轮审查
 
-不会。Webhook 层对 Push 事件做了防递归检查：若 push 的**所有** commit message 均以 `[AI-README]` 开头，webhook 直接忽略，不分发审查任务。如需自定义前缀，修改 `.env` 中 `README_COMMIT_MESSAGE_PREFIX` 并同步调整 webhook 过滤逻辑。
+不会。Webhook 层对 Push 与 MR 事件都做了**多层防递归过滤**：
+
+**Push 事件三层过滤**：
+1. 分支名以 `README_TEMP_BRANCH_PREFIX`（默认 `ai-readme/`）开头 → 忽略（受保护主分支绕过流程产生的临时分支推送）
+2. 本次推送所有 commit message 均以 `[AI-README]` 开头 → 忽略（文档自动直接提交）
+3. commit_sha 命中 MR merge 抑制标记（5 分钟 Redis TTL）→ 忽略
+
+**MR 事件两层过滤**（任一命中即忽略）：
+- source_branch 以 `README_TEMP_BRANCH_PREFIX` 开头
+- title 以 `README_MR_TITLE_PREFIX`（默认 `[AI-README]`）开头
+
+**任务层 + DB 层兜底**：
+- `run_review` 入口按 (project_id, commit_sha) 查询近 30 分钟是否已有审查 → 命中则跳过
+- `readme_records` 表 partial unique index 保证同一 commit 仅成功生成一次
+
+如需自定义前缀，修改 `.env` 中对应配置项即可（webhook 从 settings 读取，无需改代码）。
+
+### AI_README 配置受保护主分支后无法 commit
+
+代码会自动处理：探测主分支 `protected` 字段，受保护时走"临时分支 → create_commit → create_merge_request → (可选) accept_merge_request"绕过。需要确保 `GITLAB_TOKEN` 拥有：
+
+- 创建分支与 commit 的写入权限
+- 创建 MR 的权限
+- 若 `README_MR_AUTO_MERGE=true`：合并到主分支的权限
+
+`README_MR_AUTO_MERGE=false` 时仅创建 MR 等待人工合并；合并失败（如 pipeline 未完成、冲突）会降级 warning 不阻塞审查流程。

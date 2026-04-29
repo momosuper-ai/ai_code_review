@@ -155,6 +155,14 @@ docker-compose logs -f api celery --tail=50
   - **MR merge 抑制**: `_is_mr_merge_dispatched(project_id, after_sha)` 命中 Redis 标记则跳过，返回 `suppressed by MR merge event`；Redis 故障时 fail-open
   - **README 触发**: branch ∈ MAIN_BRANCHES 且审查成功 → 链式分发 README（trigger_type=push，直接 commit）
 
+### 提交人邮件通知
+
+**push 链路**：`_post_comment_async` 在 commit comment 正文开头插入 `@{user_username}\n\n`，借助 GitLab mention 机制把审查结果以邮件形式投递给 push 触发者（GitLab 默认不会主动通知 commit 作者）。`user_username` 来自 push webhook payload 顶层字段，由 `_handle_push` 透传到 `run_review.delay(author_username=...)`，再传至 `_post_comment_async`。该字段缺失时降级为普通 commit comment（不阻塞流程，warning 记录"push 评论无 author_username，跳过 @mention（fail-open）"）。
+
+**MR 链路**：`post_mr_note` 不注入 @mention，依赖 GitLab 原生 MR 评论邮件通知机制（自动通知 author/assignee/reviewer/参与者），避免重复邮件。
+
+**README 链路**：README 任务（`src/tasks/readme_task.py`）只调用 `create_commit` / `create_branch` / `create_merge_request` / `accept_merge_request` 等内容 API，**不调用任何评论 API**，自然不会触发 GitLab @mention 邮件——"README 不发邮件"是结构上的不变量。任何把 README 结果通过评论汇报的需求都需重新评估邮件触发面。
+
 ### 受保护主分支处理（仅 merge 链路）
 
 push 到主分支能成功本身即意味着主分支未保护，因此 push 链路无需探测；仅 **merge 链路**需要此流程：
@@ -244,6 +252,9 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - **上下文管理**: `chat()` 每次调用前自动 `trim_messages()`，预算 = `LLM_MAX_CONTEXT_TOKENS × LLM_CONTEXT_THRESHOLD - max_tokens`
 - **消息无损归一化**: 任何 pydantic `ChatCompletionMessage` 入消息列表前都经 `context_manager.normalize_message()` 统一转 dict（`model_dump(exclude_none=True)`），无损保留 `reasoning_content`（DeepSeek thinking）、`thinking`（Claude extended thinking）等模型特定字段；`_parse_with_retry` 重试时保留原始 response 而非仅 content，确保"需要把字段回传给下一轮"的模型（如 DeepSeek v3.2+）不会 400
 - **模型特性透传**: `LLM_EXTRA_BODY`（JSON 字符串）作为 OpenAI SDK 的 `extra_body` 下发，用于切换模型时主动控制 thinking/reasoning_effort 等参数，避免每换一个模型就改代码
+- **结构化输出（response_format）**: `chat()` 内部按 `settings.response_format_mode_for(model)` 自动决策——三档模式 `json_schema` / `json_object` / `off`，工具循环阶段（`tools` 非空）一律不挂；`tools=None` 终局调用按配置注入。可选传 `response_format=None` 显式禁用（README 等 Markdown 输出场景使用），或传 dict 显式覆盖。`LLM_RESPONSE_FORMAT_MODE_CLOUD` / `LLM_RESPONSE_FORMAT_MODE_LOCAL` 可分别覆盖云端/本地模型；DeepSeek 系仅支持 `json_object`，本地 vLLM 0.8.5+ / Qwen 系两档都支持
+- **schema 构造与重试**: 多维度 Agent 通过 `build_dimension_json_schema(dim)`、单 Agent 通过 `build_single_agent_json_schema()` 构造 OpenAI strict 兼容 schema（`additionalProperties:false`、required 全集、可空字段用 `["integer","null"]` union）；格式重试全程透传 schema_builder，落盘文件名加入 `rf_mode` 段（`{rid}_{dim}_a{attempt}_{rf_mode}_{error_type}_{ts}.txt`）便于关联分析
+- **能力探测**: `scripts/probe_structured_output.py` 用最小请求探测当前 endpoint 对各模式的支持情况，输出 Markdown 表格 + 推荐 `LLM_RESPONSE_FORMAT_MODE_*` 取值；endpoint/网关/模型变更时重跑一次
 
 ## 部署注意事项
 
@@ -370,6 +381,13 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 | `LLM_RETRY_BASE_DELAY` | `2.0` | 基础退避秒数 |
 | `LLM_RETRY_MAX_DELAY` | `30.0` | 最大退避秒数 |
 | `LLM_EXTRA_BODY` | `""` | OpenAI SDK `extra_body` JSON 透传（thinking/reasoning_effort 等） |
+
+### LLM 结构化输出（response_format）
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LLM_RESPONSE_FORMAT_MODE` | `json_object` | 全局模式: `json_schema` / `json_object` / `off` |
+| `LLM_RESPONSE_FORMAT_MODE_CLOUD` | `""` | 云端模型独立覆盖（空 = 跟随全局）；DeepSeek 仅支持 `json_object` |
+| `LLM_RESPONSE_FORMAT_MODE_LOCAL` | `""` | 本地 vLLM 独立覆盖（空 = 跟随全局）；vLLM 0.8.5+/Qwen 系可设 `json_schema` |
 
 ### 上下文管理
 | 配置项 | 默认值 | 说明 |

@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     #   OpenAI reasoning_effort:  '{"reasoning_effort": "low"}'
     LLM_EXTRA_BODY: str = ""
 
+    # LLM 结构化输出（response_format 协议层约束）
+    # 全局模式：json_schema(最强) / json_object(默认，最兼容) / off(关闭，仅 prompt 约束)
+    LLM_RESPONSE_FORMAT_MODE: str = "json_object"
+    # 云端模型独立覆盖（空 = 跟随全局）；DeepSeek 系仅支持 json_object
+    LLM_RESPONSE_FORMAT_MODE_CLOUD: str = ""
+    # 本地 vLLM 独立覆盖（空 = 跟随全局）；vLLM 0.8.5+/Qwen 系可设 json_schema
+    LLM_RESPONSE_FORMAT_MODE_LOCAL: str = ""
+
     # 上下文长度管理
     LLM_MAX_CONTEXT_TOKENS: int = 256000       # 模型最大上下文 token 数
     LLM_CONTEXT_THRESHOLD: float = 0.9         # 触发裁剪的阈值（0.9 = 230,400 tokens）
@@ -134,6 +142,16 @@ class Settings(BaseSettings):
     @property
     def enabled_dimensions(self) -> list[str]:
         return [d.strip() for d in self.REVIEW_DIMENSIONS_ENABLED.split(",") if d.strip()]
+
+    def response_format_mode_for(self, model_name: str | None) -> str:
+        """根据模型名返回 response_format 模式。云端走 cloud override，本地走 local override，最后兜底全局。"""
+        if not model_name:
+            return self.LLM_RESPONSE_FORMAT_MODE
+        if self.CLOUD_LLM_MODEL_NAME and model_name == self.CLOUD_LLM_MODEL_NAME:
+            return self.LLM_RESPONSE_FORMAT_MODE_CLOUD or self.LLM_RESPONSE_FORMAT_MODE
+        if model_name == self.VLLM_MODEL_NAME:
+            return self.LLM_RESPONSE_FORMAT_MODE_LOCAL or self.LLM_RESPONSE_FORMAT_MODE
+        return self.LLM_RESPONSE_FORMAT_MODE
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
