@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     REVIEW_DIMENSIONS_ENABLED: str = "bug,security,performance,quality,architecture"
     REVIEW_MAX_CONCURRENCY: int = 3
     REVIEW_DIMENSION_MAX_ROUNDS: int = 6
-    REVIEW_DIMENSION_TIMEOUT: int = 180
+    REVIEW_DIMENSION_TIMEOUT: int = 300
     REVIEW_SINGLE_AGENT_MODE: bool = False
 
     # Main branches to trigger review
