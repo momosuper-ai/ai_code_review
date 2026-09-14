@@ -197,7 +197,7 @@ PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录�
 
 ## Tech Stack
 
-Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, filelock. Docker Compose 编排 7 个服务（api, celery, postgres, redis, sonarqube, sonar-db, gitlab-runner）。
+Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, filelock. Docker Compose 编排 4 个服务（api, celery, postgres, redis）。
 
 ### Logging
 
@@ -222,7 +222,7 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - Agent 工具必须在 `AgentToolExecutor` 沙箱内执行，不允许路径越界
 - Celery 任务配置：soft_time_limit=600s, max_retries=2, concurrency=2
 - 配置通过 `.env` + Pydantic Settings 管理
-- SonarQube 已部署但尚未与应用代码集成（仅基础设施预留），`.env` 中有 `SONARQUBE_URL`/`SONARQUBE_TOKEN` 配置
+- SonarQube 尚未与应用代码集成，`.env` 中有 `SONARQUBE_URL`/`SONARQUBE_TOKEN` 预留配置项
 - `config.py` 中 `REDIS_URL` 默认值无密码，生产环境必须通过 `.env` 配置带密码的 URL
 - Webhook 安全：通过 `X-Gitlab-Token` header 验证，由 `src/utils/security.py` 实现；未配置 `GITLAB_WEBHOOK_SECRET` 时默认放行（仅限开发环境）
 - API Key 认证：Reviews API 通过 `X-API-Key` header 验证，未配置 `API_KEYS` 时默认放行（开发模式）；生成密钥：`python -c "import secrets; print(secrets.token_urlsafe(32))"`
@@ -254,7 +254,7 @@ Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, fil
 - **模型特性透传**: `LLM_EXTRA_BODY`（JSON 字符串）作为 OpenAI SDK 的 `extra_body` 下发，用于切换模型时主动控制 thinking/reasoning_effort 等参数，避免每换一个模型就改代码
 - **结构化输出（response_format）**: `chat()` 内部按 `settings.response_format_mode_for(model)` 自动决策——三档模式 `json_schema` / `json_object` / `off`，工具循环阶段（`tools` 非空）一律不挂；`tools=None` 终局调用按配置注入。可选传 `response_format=None` 显式禁用（README 等 Markdown 输出场景使用），或传 dict 显式覆盖。`LLM_RESPONSE_FORMAT_MODE_CLOUD` / `LLM_RESPONSE_FORMAT_MODE_LOCAL` 可分别覆盖云端/本地模型；DeepSeek 系仅支持 `json_object`，本地 vLLM 0.8.5+ / Qwen 系两档都支持
 - **schema 构造与重试**: 多维度 Agent 通过 `build_dimension_json_schema(dim)`、单 Agent 通过 `build_single_agent_json_schema()` 构造 OpenAI strict 兼容 schema（`additionalProperties:false`、required 全集、可空字段用 `["integer","null"]` union）；格式重试全程透传 schema_builder，落盘文件名加入 `rf_mode` 段（`{rid}_{dim}_a{attempt}_{rf_mode}_{error_type}_{ts}.txt`）便于关联分析
-- **能力探测**: `scripts/probe_structured_output.py` 用最小请求探测当前 endpoint 对各模式的支持情况，输出 Markdown 表格 + 推荐 `LLM_RESPONSE_FORMAT_MODE_*` 取值；endpoint/网关/模型变更时重跑一次
+- **能力探测**: 切换 endpoint/网关/模型时，先用最小请求探测当前 endpoint 对各模式的支持情况，再设置 `LLM_RESPONSE_FORMAT_MODE_*`；探测建议：云端用 DeepSeek 系确认 `json_object` 可用，本地用 vLLM 0.8.5+/Qwen 系尝试 `json_schema`
 
 ## 部署注意事项
 

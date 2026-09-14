@@ -123,7 +123,7 @@ VLLM_MODEL_NAME=mistralai/Devstral-Small-2-24B-Instruct-2512
 docker-compose up --build -d
 ```
 
-这将启动 7 个容器：
+这将启动 4 个容器：
 
 | 服务 | 说明 | 端口 |
 |------|------|------|
@@ -131,11 +131,6 @@ docker-compose up --build -d
 | `celery` | Celery 异步任务 Worker | - |
 | `postgres` | PostgreSQL 16 数据库 | 127.0.0.1:5433->5432 |
 | `redis` | Redis 7 消息队列 | 127.0.0.1:6379 |
-| `sonarqube` | SonarQube 代码质量平台（预留） | 9002->9000 |
-| `sonar-db` | SonarQube 专用 PostgreSQL | - |
-| `gitlab-runner` | GitLab Runner | - |
-
-> **注**：sonarqube / sonar-db / gitlab-runner 为基础设施预留，尚未与应用代码集成。
 
 数据库迁移（在另一个终端，容器 postgres 启动后执行）
 docker-compose exec api alembic upgrade head
@@ -450,7 +445,7 @@ GET /api/v1/reviews/{review_id}
 
 > 工具调用循环阶段（`tools` 非空）一律不挂 response_format（与 tools 并存会冲突）；终局调用（`tools=None`）才注入。README 文档生成显式传 `response_format=None` 禁用，保证 Markdown 输出不被强制 JSON。
 >
-> 切换前可运行 `docker-compose exec api python scripts/probe_structured_output.py` 探测当前 endpoint 对各模式的支持情况，根据输出建议设置 LOCAL/CLOUD 覆盖。
+> 切换前建议用最小请求探测当前 endpoint 对各模式的支持情况（vLLM 0.8.5+ / Qwen 系支持 `json_schema`，DeepSeek 系仅支持 `json_object`），再设置 LOCAL/CLOUD 覆盖。
 
 ### 上下文管理
 
@@ -612,7 +607,7 @@ obc_ai_code_review/
 ├── .env                          # 环境变量配置（不提交）
 ├── .env.example                  # 环境变量模板
 ├── Dockerfile                    # 容器构建文件
-├── docker-compose.yml            # 服务编排（7个服务）
+├── docker-compose.yml            # 服务编排（4个服务）
 ├── pyproject.toml                # Python 项目依赖
 ├── alembic.ini                   # 数据库迁移配置
 ├── alembic/                      # 数据库迁移脚本
@@ -654,8 +649,6 @@ obc_ai_code_review/
 │       ├── security.py           # Webhook Token + API Key 认证
 │       ├── rate_limit.py         # Redis 固定窗口速率限制
 │       └── ip_whitelist.py       # IP 白名单中间件
-├── scripts/                     # 运维/探测脚本
-│   └── probe_structured_output.py  # 探测 endpoint 对 response_format 各模式的支持
 └── tests/                        # 测试
     └── unit/
         ├── test_agent_tools.py
@@ -772,3 +765,15 @@ docker-compose exec api alembic upgrade head   # 首次启用需确保 readme_re
 - 若 `README_MR_AUTO_MERGE=true`：合并到主分支的权限
 
 `README_MR_AUTO_MERGE=false` 时仅创建 MR 等待人工合并；合并失败（如 pipeline 未完成、冲突）会降级 warning 不阻塞审查流程。
+
+## 参与贡献
+
+欢迎任何形式的贡献！请先阅读：
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 开发环境、测试命令、代码与提交规范、硬纪律表
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — 社区行为准则
+- [SECURITY.md](SECURITY.md) — 安全边界说明与漏洞报告方式
+- [CHANGELOG.md](CHANGELOG.md) — 版本变更历史
+- [LICENSE](LICENSE) — MIT License
+
+**架构与设计决策记录**：详见 `CLAUDE.md` / `AGENTS.md`（两个文件内容同步），其中记录了多维度审查、隐私过滤流水线、影响面预分析、受保护主分支绕过流程、防递归三层防御、"README 链路不发邮件"结构不变量等关键设计决策。
