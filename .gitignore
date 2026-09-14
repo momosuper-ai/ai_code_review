@@ -4,6 +4,9 @@
 # Environment variables (contains secrets)
 .env
 
+# Retired local infra images (kept on disk, not published)
+sonarqube/
+
 # Python
 __pycache__/
 *.py[cod]

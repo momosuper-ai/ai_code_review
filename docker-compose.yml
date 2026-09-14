@@ -77,57 +77,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-  sonarqube:
-    build:
-      context: ./sonarqube
-      dockerfile: Dockerfile
-    ports:
-      - "9002:9000"
-    environment:
-      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonarqube
-      SONAR_JDBC_USERNAME: sonarqube
-      SONAR_JDBC_PASSWORD: sonarqube
-      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
-    volumes:
-      - sonarqube_data:/opt/sonarqube/data
-      - sonarqube_logs:/opt/sonarqube/logs
-      - sonarqube_extensions:/opt/sonarqube/extensions
-    depends_on:
-      sonar-db:
-        condition: service_healthy
-
-  sonar-db:
-    image: postgres:16-alpine
-    container_name: obc-sonar-postgres
-    environment:
-      POSTGRES_USER: sonarqube
-      POSTGRES_PASSWORD: sonarqube
-      POSTGRES_DB: sonarqube
-    volumes:
-      - sonar_pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sonarqube"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  gitlab-runner:
-    image: gitlab/gitlab-runner:latest
-    container_name: gitlab-runner
-    restart: always
-    volumes:
-      - gitlab_runner_config:/etc/gitlab-runner
-      - //var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - sonarqube
-
 volumes:
   pgdata:
   redisdata:
   repos_data:
   logs_data:
-  sonarqube_data:
-  sonarqube_logs:
-  sonarqube_extensions:
-  sonar_pgdata:
-  gitlab_runner_config:
