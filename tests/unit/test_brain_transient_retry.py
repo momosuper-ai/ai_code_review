@@ -1,3 +1,4 @@
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -8,7 +9,9 @@ from sqlalchemy import select
 from src.config import settings
 from src.core.project_brain.exceptions import ModelTransportFailed, PrivacyResponseInvalid
 from src.core.project_brain.execution import pause_build, resume_build
+from src.core.project_brain.incremental import IncrementalRejected, accept_incremental
 from src.core.project_brain.lifecycle import BudgetExhausted, create_build
+from src.core.project_brain.trusted_packet import checkpoint_digest
 from src.models.brain import BrainBuild, BrainModelCall, BrainProject, BrainUnit, utcnow
 from src.tasks import brain_task
 from tests.unit.test_project_brain import database  # noqa: F401
@@ -23,6 +26,265 @@ def _build(database, count=1, commit="a" * 40):
         session.add_all(units[1:])
         session.commit()
         return build.id, [unit.id for unit in units]
+
+
+def _incremental_trial(database):
+    parent_id, (parent_unit_id,) = _build(database, commit="d" * 40)
+    child_id, (child_unit_id,) = _build(database, commit="e" * 40)
+    safe = {"title": "Module", "claims": [{"text": "claim", "evidence_ids": ["evidence"],
+            "source_scope": None}], "unknowns": [], "document_path": None}
+    with database() as session:
+        parent = session.get(BrainBuild, parent_id)
+        parent.status = "ready"
+        parent.coverage = {"public_schema_version": "2.0"}
+        parent_unit = session.get(BrainUnit, parent_unit_id)
+        parent_unit.kind, parent_unit.status = "compile", "completed"
+        parent_unit.input_hash, parent_unit.result = "input", safe
+        child = session.get(BrainBuild, child_id)
+        child.base_build_id, child.recipe_hash = parent_id, parent.recipe_hash
+        child_unit = session.get(BrainUnit, child_unit_id)
+        child_unit.kind, child_unit.input_hash = "compile", "input"
+        session.commit()
+    return parent_id, parent_unit_id, child_id, child_unit_id, safe
+
+
+def test_incremental_accept_strips_marker_and_records_proof(database, monkeypatch):
+    import src.core.project_brain.incremental as incremental
+
+    parent_id, parent_unit_id, child_id, child_unit_id, safe = _incremental_trial(database)
+    monkeypatch.setattr(incremental, "_parent_is_trusted", lambda *args: True)
+    marker = {"base_build_id": parent_id, "parent_unit_id": parent_unit_id,
+              "parent_input_hash": "input", "result_hash": checkpoint_digest(safe), "input_hash": "input"}
+    with database() as session:
+        build, unit = session.get(BrainBuild, child_id), session.get(BrainUnit, child_unit_id)
+        assert accept_incremental(session, build, unit, {**safe, "_incremental_import": marker}) == safe
+        assert build.diagnostic["incremental_imports"][str(unit.id)] == marker
+
+
+def test_incremental_accept_rejects_tampered_parent(database):
+    parent_id, parent_unit_id, child_id, child_unit_id, safe = _incremental_trial(database)
+    marker = {"base_build_id": parent_id, "parent_unit_id": parent_unit_id,
+              "parent_input_hash": "input", "result_hash": checkpoint_digest(safe), "input_hash": "input"}
+    with database() as session:
+        session.get(BrainUnit, parent_unit_id).result = {**safe, "title": "tampered"}
+        build, unit = session.get(BrainBuild, child_id), session.get(BrainUnit, child_unit_id)
+        with pytest.raises(IncrementalRejected):
+            accept_incremental(session, build, unit, {**safe, "_incremental_import": marker})
+
+
+def test_incremental_base_requires_ready_schema2_recipe_and_project(database):
+    from src.core.project_brain.incremental import _base_build
+
+    parent_id, _, child_id, _, _ = _incremental_trial(database)
+    with database() as session:
+        parent, child = session.get(BrainBuild, parent_id), session.get(BrainBuild, child_id)
+        assert _base_build(session, child, parent_id) is parent
+        child.project_id = child.project_id + 1
+        assert _base_build(session, child, parent_id) is None
+        child.project_id = parent.project_id
+        parent.status = "failed"
+        assert _base_build(session, child, parent_id) is None
+        parent.status = "ready"
+        parent.coverage = {"public_schema_version": "1.0"}
+        assert _base_build(session, child, parent_id) is None
+        parent.coverage = {"public_schema_version": "2.0"}
+        parent.recipe_hash = "different"
+        assert _base_build(session, child, parent_id) is None
+
+
+def test_legacy_ready_incremental_build_without_summary_remains_valid(database):
+    import src.core.project_brain.incremental as incremental
+
+    _, _, child_id, _, _ = _incremental_trial(database)
+    with database() as session:
+        child = session.get(BrainBuild, child_id)
+        child.status = "ready"
+        child.coverage = {"public_schema_version": "1.0"}
+        child.diagnostic = None
+        incremental.verify_incremental_dependencies(session, child)
+
+
+def test_current_ready_incremental_build_requires_summary(database):
+    import src.core.project_brain.incremental as incremental
+
+    _, _, child_id, _, _ = _incremental_trial(database)
+    with database() as session:
+        child = session.get(BrainBuild, child_id)
+        child.status = "ready"
+        child.coverage = {"public_schema_version": "2.0"}
+        child.diagnostic = {"generator_version": "project-brain/2.4.1"}
+        with pytest.raises(IncrementalRejected):
+            incremental.verify_incremental_dependencies(session, child)
+
+
+def test_incremental_import_requires_summary(database):
+    import src.core.project_brain.incremental as incremental
+
+    _, _, child_id, _, _ = _incremental_trial(database)
+    with database() as session:
+        child = session.get(BrainBuild, child_id)
+        child.status = "ready"
+        child.coverage = {"public_schema_version": "1.0"}
+        child.diagnostic = {"incremental_imports": {"1": {}}}
+        with pytest.raises(IncrementalRejected):
+            incremental.verify_incremental_dependencies(session, child)
+
+
+def test_unparseable_generator_version_requires_incremental_summary(database):
+    import src.core.project_brain.incremental as incremental
+
+    _, _, child_id, _, _ = _incremental_trial(database)
+    with database() as session:
+        child = session.get(BrainBuild, child_id)
+        child.status = "ready"
+        child.coverage = {"public_schema_version": "1.0"}
+        child.diagnostic = {"generator_version": "unparseable"}
+        with pytest.raises(IncrementalRejected):
+            incremental.verify_incremental_dependencies(session, child)
+
+
+def test_recovery_does_not_treat_incremental_no_call_as_recovery_proof(database):
+    from src.core.project_brain.recovery import _successful_unit_calls
+
+    parent_id, parent_unit_id, _, _, _ = _incremental_trial(database)
+    with database() as session:
+        parent = session.get(BrainBuild, parent_id)
+        parent.diagnostic = {"incremental_imports": {str(parent_unit_id): {"input_hash": "input"}}}
+        unit = session.get(BrainUnit, parent_unit_id)
+        assert _successful_unit_calls(session, unit) is False
+
+
+def test_chained_incremental_checkpoint_remains_a_valid_parent(database, monkeypatch):
+    import src.core.project_brain.incremental as incremental
+    import src.core.project_brain.recovery as recovery
+
+    root_id, root_unit_id, middle_id, middle_unit_id, safe = _incremental_trial(database)
+    monkeypatch.setattr(recovery, "_successful_unit_calls", lambda *args: True)
+    marker = {"base_build_id": root_id, "parent_unit_id": root_unit_id,
+              "parent_input_hash": "input", "result_hash": checkpoint_digest(safe), "input_hash": "input"}
+    with database() as session:
+        middle, unit = session.get(BrainBuild, middle_id), session.get(BrainUnit, middle_unit_id)
+        middle.status = "ready"
+        middle.coverage = {"public_schema_version": "2.0", "incremental": {
+            "base_build_id": root_id, "reused_compile_units": 1, "compiled_units": 0}}
+        middle.diagnostic = {"incremental_imports": {str(unit.id): marker}}
+        unit.status, unit.result = "completed", safe
+        session.add(BrainModelCall(id=str(uuid4()), build_id=root_id, unit_id=root_unit_id,
+            lease_token=str(uuid4()), stage="compile", role="semantic", purpose="generic",
+            requested_model="synthetic", attempt=1, state="settled", reserved_tokens=0,
+            settled_at=utcnow()))
+        assert incremental._parent_is_trusted(session, unit)
+        middle.diagnostic = {}
+        with pytest.raises(incremental.IncrementalRejected):
+            incremental.verify_incremental_dependencies(session, middle)
+
+
+def test_incremental_import_increments_finalize_cache_hits(database, monkeypatch):
+    import src.core.project_brain.incremental as incremental
+
+    build_id, (unit_id,) = _build(database)
+    unit, build, _, token = brain_task.claim_unit(unit_id)
+    with database() as session:
+        session.get(BrainBuild, build_id).status = "compiling"
+        session.get(BrainUnit, unit_id).kind = "compile"
+        session.add(BrainUnit(build_id=build_id, key="finalize", kind="finalize", status="completed",
+                              result={"cache_hits": 7}))
+        session.commit()
+
+    monkeypatch.setattr(incremental, "accept_incremental",
+        lambda session, build, unit, result: {key: value for key, value in result.items()
+                                              if key != "_incremental_import"})
+    result = {"title": "Module", "_incremental_import": {"parent_unit_id": 1}}
+    assert brain_task._complete(unit.id, token, result)
+    with database() as session:
+        stored = session.get(BrainUnit, unit_id)
+        final = session.scalar(select(BrainUnit).where(
+            BrainUnit.build_id == build_id, BrainUnit.kind == "finalize"))
+        assert stored.result == {"title": "Module"}
+        assert final.result["cache_hits"] == 8
+
+
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.parametrize("change", ["unchanged", "blob_changed", "dependency_changed", "privacy_projection_changed"])
+def test_incremental_reuses_matching_input_hash_despite_index_shift(database, monkeypatch, index, change):
+    import src.core.project_brain.compiler as compiler
+    import src.core.project_brain.incremental as incremental
+    from src.core.project_brain.trusted_packet import VerifiedPacket
+
+    parent_id, parent_unit_id, child_id, child_unit_id, safe = _incremental_trial(database)
+    contexts = [
+        {"module_id": "other", "items": []},
+        {"module_id": "module", "items": [{"fact": {"id": "fact"}, "evidence": [{"id": "evidence"}]}]},
+    ]
+    if index == 0:
+        contexts = [contexts[1]]
+
+    class Bundle:
+        source_commit = "e" * 40
+
+        def model_dump(self):
+            return {"source_commit": self.source_commit}
+
+    class Guard:
+        filter = object()
+
+        def __init__(self):
+            self.checked = False
+
+        def check_discoveries(self):
+            self.checked = True
+
+        async def close(self):
+            pass
+
+    class Proof:
+        def validate(self, packet):
+            assert packet == contexts[index]
+
+    class Store:
+        def directory(self, *_):
+            return "/snapshot"
+
+    class Catalog:
+        snapshot = object()
+
+    guard = Guard()
+    monkeypatch.setattr(incremental, "_parent_is_trusted", lambda *args: True)
+    monkeypatch.setattr("src.core.project_brain.snapshot.read_snapshot", lambda *_: object())
+    monkeypatch.setattr(brain_task, "_source_catalog", lambda *args: Catalog())
+    monkeypatch.setattr(brain_task, "_read_source_bundle", lambda *args: Bundle())
+    monkeypatch.setattr(brain_task, "_contexts", lambda *args: contexts)
+    monkeypatch.setattr(brain_task, "_bind_source_identity", lambda *args: None)
+    monkeypatch.setattr(brain_task, "_guard", lambda *args, **kwargs: guard)
+    packet_hash = "input" if change in {"unchanged", "privacy_projection_changed"} else "changed-input"
+    monkeypatch.setattr(compiler, "packet_hash", lambda *_: packet_hash)
+    projected = safe if change != "privacy_projection_changed" else {**safe, "title": "redacted"}
+    monkeypatch.setattr(compiler, "project_compilation_texts", lambda value, _filter: projected)
+    monkeypatch.setattr(VerifiedPacket, "from_checkpoint", classmethod(lambda cls, *args, **kwargs: Proof()))
+    with database() as session:
+        unit = session.get(BrainUnit, child_unit_id)
+        unit.payload = {"index": index, "module_id": "module", "fact_ids": ["fact"]}
+        session.add_all([
+            BrainUnit(build_id=child_id, key="finalize", kind="finalize", status="completed",
+                      result={"bundle_mac": "mac"}),
+            BrainUnit(build_id=child_id, key="privacy:0", kind="privacy", status="completed"),
+            BrainUnit(build_id=child_id, key="source_privacy:0", kind="source_privacy", status="completed"),
+        ])
+        session.commit()
+        build = session.get(BrainBuild, child_id)
+        project = session.get(BrainProject, build.project_id)
+        result = asyncio.run(incremental.incremental_compile_checkpoint(
+            unit, build, project, "lease", Store()))
+    if change in {"blob_changed", "dependency_changed", "privacy_projection_changed"}:
+        assert result is None
+    else:
+        assert result == {**safe, "_incremental_import": {
+            "base_build_id": parent_id, "parent_unit_id": parent_unit_id,
+            "parent_input_hash": "input", "result_hash": checkpoint_digest(safe), "input_hash": "input"}}
+    assert guard.checked is (change in {"unchanged", "privacy_projection_changed"})
+    with database() as session:
+        assert not session.scalars(select(BrainModelCall).where(
+            BrainModelCall.build_id == child_id, BrainModelCall.unit_id == child_unit_id)).all()
 
 
 @pytest.mark.parametrize("failure,countdowns", [
@@ -141,6 +403,7 @@ def test_manual_resume_closes_breaker_and_beat_respects_trip_cap(database, monke
     with database() as session:
         build = session.get(BrainBuild, build_id)
         assert build.status == "failed"
+        assert build.execution_state == "running"
         assert build.error_message == "上游模型服务持续异常，熔断次数已达上限；failure_code=upstream_unhealthy"
 
 

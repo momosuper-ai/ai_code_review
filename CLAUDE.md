@@ -197,7 +197,7 @@ PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录�
 
 ## Project Brain
 
-`src/core/project_brain/` implements versioned, evidence-backed knowledge generation; migrations `005`–`011` track its schema. Unit diagnostics and fixed-name timing are persisted in nullable JSON fields. Transient retry/backoff and breaker settings live in `src/config.py`; unknown calls, privacy/evidence checks, and budget limits remain terminal gates. `scripts/brain_timing_report.py` reads timing data with SELECT-only queries.
+`src/core/project_brain/` implements versioned, evidence-backed knowledge generation; migrations `005`–`011` track its schema. Unit diagnostics and fixed-name timing are persisted in nullable JSON fields. Transient retry/backoff and breaker settings live in `src/config.py`; schema2 cross-commit compile reuse is implemented in `incremental.py` and revalidates privacy/source-privacy fully. Unknown calls, privacy/evidence checks, and budget limits remain terminal gates. `scripts/brain_timing_report.py` reads timing data with SELECT-only queries.
 
 ## Tech Stack
 

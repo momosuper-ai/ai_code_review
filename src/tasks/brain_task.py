@@ -851,8 +851,10 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
             session.commit()
             return False
         from src.core.project_brain.recovery import accept_import
-        inherited = "_recovery_import" in result
+        inherited = "_recovery_import" in result or "_incremental_import" in result
         result = accept_import(session, build, unit, result)
+        from src.core.project_brain.incremental import accept_incremental
+        result = accept_incremental(session, build, unit, result)
         if inherited:
             final = session.scalar(select(BrainUnit).where(BrainUnit.build_id == build.id, BrainUnit.kind == "finalize"))
             final.result = {**final.result, "cache_hits": final.result.get("cache_hits", 0) + 1}
@@ -908,6 +910,17 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
                 if ledger.seal(sealed["revision"], sealed["content_digest"]) != sealed:
                     raise PrivacySealConflict()
             original_coverage = build.coverage or {}
+            from src.core.project_brain.incremental import verify_incremental_dependencies
+            verify_incremental_dependencies(session, build)
+            imports = (build.diagnostic or {}).get("incremental_imports", {})
+            if build.base_build_id:
+                compiled = session.scalars(select(BrainUnit).where(
+                    BrainUnit.build_id == build.id, BrainUnit.kind == "compile",
+                    BrainUnit.status == "completed")).all()
+                result["coverage"] = {**result["coverage"], "incremental": {
+                    "base_build_id": build.base_build_id,
+                    "reused_compile_units": len(imports),
+                    "compiled_units": len(compiled) - len(imports)}}
             build.artifact_path, build.coverage = result["artifact_path"], {**result["coverage"],
                 **{key: original_coverage[key] for key in ("component_recipes", "recovery_protocol") if key in original_coverage}}
             if original_coverage.get("recovery_protocol"):
@@ -1248,9 +1261,10 @@ def recover_brain() -> dict:
             if type(trips) is not int or trips < 0:
                 trips = settings.PROJECT_BRAIN_BREAKER_MAX_TRIPS + 1
             if trips > settings.PROJECT_BRAIN_BREAKER_MAX_TRIPS:
-                build.status, build.completed_at = "failed", now
+                build.status, build.completed_at, build.execution_state = "failed", now, "running"
                 build.error_message = "上游模型服务持续异常，熔断次数已达上限；failure_code=upstream_unhealthy"
                 _cancel_unfinished(session, build.id)
+                _finish_execution_control(session, build)
                 session.commit()
                 continue
             try:

@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.api.v1 import brain as api
+from src.config import settings
 from src.core.project_brain.public_schema import PublicBrainManifest, PublicMetadata, PublicProjectionInfo
 from src.core.project_brain.publisher import publication_actions, publish
 from src.models.brain import BrainBuild, BrainProject, BrainPublication, BrainUnit
@@ -126,6 +127,45 @@ async def test_all_public_content_endpoints_authenticate_db_manifest_before_retu
     assert error.value.status_code == 409
     store.read_cards.assert_not_called()
     store.export_path.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_ready_build_with_base_and_no_incremental_summary_is_accessible(database, monkeypatch):
+    import httpx
+    from fastapi import FastAPI
+    from src.core.project_brain.lifecycle import create_build
+    from src.models import get_session
+    from tests.unit.test_project_brain import AsyncSessionAdapter
+
+    with database() as session:
+        base = create_build(session, 1, "main", "synthetic/retry", "a" * 40)
+        base.status, base.artifact_path = "ready", "legacy"
+        base.coverage = {"public_schema_version": "1.0"}
+        child = create_build(session, 1, "main", "synthetic/retry", "b" * 40)
+        assert child.base_build_id == base.id
+        child.status = "ready"
+        child.coverage = {"public_schema_version": "1.0"}
+        child.diagnostic = None
+        project = session.get(BrainProject, child.project_id)
+        project.active_build_id = child.id
+        session.commit()
+
+    monkeypatch.setattr(settings, "API_KEYS", "internal-test-key")
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(api, "_public_manifest", lambda build: None)
+    app = FastAPI()
+    app.include_router(api.router, prefix="/api/v1")
+
+    async def dependency():
+        async with AsyncSessionAdapter(database) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = dependency
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/projects/1/brain", params={"branch": "main"},
+                                    headers={"X-API-Key": "internal-test-key"})
+    assert response.status_code == 200
+    assert response.json()["current"]["status"] == "ready"
 
 
 @pytest.mark.asyncio
