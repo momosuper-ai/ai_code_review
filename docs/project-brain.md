@@ -25,6 +25,10 @@ Webhook 认证后先持久化 Brain 事件，再进入审查去重与投递。�
 
 同输入的旧产物已清理/损坏时，创建下一 generation、新 build_id 和知识版本；旧历史元数据不改写。
 
+## 瞬时失败重试与诊断
+
+Project Brain 2.4.0 对模型传输、隐私响应校验和本地工作准入拒绝使用有界单元重试，并以构建级熔断暂停/排空；预算、来源/检查点/封存和未知调用门禁保持终态。重试与熔断配置见 `src/config.py` 的 `PROJECT_BRAIN_UNIT_TRANSIENT_RETRIES`、`PROJECT_BRAIN_TRANSIENT_BACKOFF_SECONDS`、`PROJECT_BRAIN_BREAKER_*`。迁移 `011_brain_diagnostics` 为构建和单元增加可空 JSON `diagnostic` 列。字段、安全边界、自动恢复及只读时序报告见 [project-brain-transient-retry.md](project-brain-transient-retry.md)。
+
 Brain 模式停止旧 README 分发及最终写入，覆盖已排队/已生成待提交任务；旧文件和历史保留。暂停 Brain 不恢复 README；关闭总开关并显式启用 README 才恢复旧流程。
 
 ## 知识与文件组织

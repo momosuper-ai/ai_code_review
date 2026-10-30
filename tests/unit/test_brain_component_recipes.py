@@ -115,6 +115,15 @@ def test_implementation_dependency_changes_are_scoped(source_tree, relative, aff
     assert recipes.recipe_hash() != audit_before
 
 
+def test_timing_and_transport_changes_do_not_invalidate_component_hashes(source_tree):
+    before = recipes.component_recipes()
+    transport = source_tree / "core/project_brain/transport.py"
+    transport.write_text(transport.read_text(encoding="utf-8") + "\n# synthetic timing revision\n", encoding="utf-8")
+    (source_tree / "core/project_brain/timing.py").write_text(
+        "def synthetic_timing():\n    return 1\n", encoding="utf-8")
+    assert recipes.component_recipes() == before
+
+
 def test_diagnostic_backend_repair_does_not_invalidate_client_content(source_tree):
     before, audit_before = recipes.component_recipes(), recipes.recipe_hash()
     path = source_tree / "core/llm_client.py"

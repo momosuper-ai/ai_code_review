@@ -1,4 +1,4 @@
 """Versioned, evidence-backed project knowledge generation."""
 
-GENERATOR_VERSION = "project-brain/2.3.4"
+GENERATOR_VERSION = "project-brain/2.4.0"
 SCHEMA_VERSION = "2.0"

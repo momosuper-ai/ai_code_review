@@ -195,6 +195,10 @@ PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录�
 - `GET /api/v1/reviews` — 审查记录列表（分页、按 project_id/status 过滤，需 API Key，速率限制 60/min）
 - `GET /api/v1/reviews/{review_id}` — 审查详情（含关联 comments，需 API Key，速率限制 60/min）
 
+## Project Brain
+
+`src/core/project_brain/` implements versioned, evidence-backed knowledge generation; migrations `005`–`011` track its schema. Unit diagnostics and fixed-name timing are persisted in nullable JSON fields. Transient retry/backoff and breaker settings live in `src/config.py`; unknown calls, privacy/evidence checks, and budget limits remain terminal gates. `scripts/brain_timing_report.py` reads timing data with SELECT-only queries.
+
 ## Tech Stack
 
 Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, filelock. Docker Compose 编排 4 个服务（api, celery, postgres, redis）。

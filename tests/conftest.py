@@ -1,6 +1,9 @@
 import os
 import tempfile
 
+os.environ.setdefault("VLLM_API_KEY", "synthetic")
+os.environ.setdefault("REPOS_BASE_DIR", tempfile.mkdtemp(prefix="aicr-repos-"))
+
 import pytest
 
 from src.core.agent_tools import AgentToolExecutor

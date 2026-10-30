@@ -490,6 +490,7 @@ async def execute_recoverable(original, unit, build, project, token):
 
 
 async def _execute_recovery(original, unit, build, project, token):
+    from src.core.project_brain import timing
     from src.core.project_brain.lifecycle import SyncSession
     from src.core.project_brain.artifacts import ArtifactStore
     if (build.coverage or {}).get("recovery_protocol") != PROTOCOL:
@@ -508,7 +509,8 @@ async def _execute_recovery(original, unit, build, project, token):
             session.commit()
         return result
     with SyncSession() as session:
-        loaded = load_recovery(session, build, project, store)
+        with timing.segment("recovery_auth"):
+            loaded = load_recovery(session, build, project, store)
     if unit.kind == "compile":
         inherited = await _compile_checkpoint(unit, build, project, token, store, loaded)
         if inherited is not None:

@@ -37,6 +37,9 @@ def test_ready_keeps_closed_cost_but_only_success_can_supply_privacy_origins(dat
 def test_http_recovery_exhaustion_never_falls_through_to_celery_retry(database, monkeypatch, code):
     build_id, unit_id, sibling_id, completed_id = work(database)
     call_id, group = str(uuid4()), str(uuid4())
+    with database() as session:
+        session.get(BrainUnit, unit_id).diagnostic = {"transient_retries": 3}
+        session.commit()
 
     async def fail(unit, build, project, token):
         meter = BuildCallMeter(build.id, unit.id, token)
@@ -49,8 +52,11 @@ def test_http_recovery_exhaustion_never_falls_through_to_celery_retry(database, 
     retry = MagicMock()
     monkeypatch.setattr(execute_brain_unit, "retry", retry)
     monkeypatch.setattr("src.tasks.brain_task.dispatch_pending", MagicMock())
+    dispatch = MagicMock()
+    monkeypatch.setattr(execute_brain_unit, "apply_async", dispatch)
     assert execute_brain_unit.run(unit_id) == {"status": "failed"}
     retry.assert_not_called()
+    dispatch.assert_not_called()
     with database() as session:
         build = session.get(BrainBuild, build_id)
         current = session.get(BrainUnit, unit_id)
