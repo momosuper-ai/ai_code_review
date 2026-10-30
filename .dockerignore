@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+secrets
+.venv
+venv
+__pycache__
+.pytest_cache
+*.log
+sonarqube

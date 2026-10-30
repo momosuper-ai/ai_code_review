@@ -1,0 +1,112 @@
+name: obc-brain-local
+
+x-app: &app
+  image: obc-brain-local:dev
+  build:
+    context: .
+    target: local-test
+  env_file: .env.brain-local
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  environment: &environment
+    BRAIN_LOCAL_TEST: "1"
+    DATABASE_URL: postgresql+asyncpg://brain_local:${BRAIN_LOCAL_DB_PASSWORD:?请先初始化本机测试配置}@postgres:5432/obc_brain_local
+    REDIS_URL: redis://:${BRAIN_LOCAL_REDIS_PASSWORD:?请先初始化本机测试配置}@redis:6379/0
+    REPOS_BASE_DIR: /data/repos
+    PROJECT_BRAIN_BASE_DIR: /data/project_brain
+    PROJECT_BRAIN_WORK_DIR: /data/project_brain_work
+    README_GENERATION_ENABLED: "false"
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: brain_local
+      POSTGRES_PASSWORD: ${BRAIN_LOCAL_DB_PASSWORD:?请先初始化本机测试配置}
+      POSTGRES_DB: obc_brain_local
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U brain_local -d obc_brain_local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${BRAIN_LOCAL_REDIS_PASSWORD:?请先初始化本机测试配置}
+    command: [sh, -c, 'exec redis-server --requirepass "$$REDIS_PASSWORD"']
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  check:
+    <<: *app
+    profiles: [check]
+    command: [python, scripts/brain_local.py, bootstrap]
+    volumes:
+      - brain_data:/data/project_brain
+      - brain_work_data:/data/project_brain_work
+
+  api:
+    <<: *app
+    ports: ["${BRAIN_LOCAL_BIND_ADDRESS:-127.0.0.1}:${BRAIN_LOCAL_API_PORT:-18080}:8000"]
+    command: [uvicorn, src.main:app, --host, 0.0.0.0, --port, "8000"]
+    volumes: [brain_data:/data/project_brain:ro]
+
+  brain-worker:
+    <<: *app
+    command: [celery, -A, src.tasks.celery_app, worker, --loglevel=info, --concurrency=2, -Q, brain]
+    volumes:
+      - repos_data:/data/repos
+      - brain_data:/data/project_brain
+      - brain_work_data:/data/project_brain_work
+
+  celery-beat:
+    <<: *app
+    command: [celery, -A, src.tasks.celery_app, beat, --loglevel=info, --schedule=/data/beat/celerybeat-schedule]
+    volumes: [beat_data:/data/beat]
+
+  review-worker:
+    <<: *app
+    profiles: [review]
+    command: [celery, -A, src.tasks.celery_app, worker, --loglevel=info, --concurrency=2, -Q, "review,celery,readme"]
+    volumes: [repos_data:/data/repos]
+
+  brain-publisher:
+    image: obc-brain-local:dev
+    profiles: [publication]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://brain_local:${BRAIN_LOCAL_DB_PASSWORD:?请先初始化本机测试配置}@postgres:5432/obc_brain_local
+      REDIS_URL: redis://:${BRAIN_LOCAL_REDIS_PASSWORD:?请先初始化本机测试配置}@redis:6379/0
+      GITLAB_URL: ${GITLAB_URL:?请先初始化本机测试配置}
+      GITLAB_BRAIN_PUBLISH_TOKEN_FILE: /run/secrets/brain_publish_token
+      PROJECT_BRAIN_ENABLED: "true"
+      PROJECT_BRAIN_BASE_DIR: /data/project_brain
+      PROJECT_BRAIN_TEMP_BRANCH_PREFIX: ai-brain/
+      PROJECT_BRAIN_MR_AUTO_MERGE: ${PROJECT_BRAIN_MR_AUTO_MERGE:-false}
+      MAIN_BRANCHES: ${MAIN_BRANCHES:-main,master}
+      LOG_FORMAT: json
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    command: [celery, -A, src.tasks.celery_app, worker, --loglevel=info, --concurrency=1, -Q, brain-publication]
+    volumes: [brain_data:/data/project_brain:ro]
+    secrets: [brain_publish_token]
+
+volumes:
+  postgres_data:
+  redis_data:
+  repos_data:
+  brain_data:
+  brain_work_data:
+  beat_data:
+
+secrets:
+  brain_publish_token:
+    file: ./secrets/brain-local-publish-token

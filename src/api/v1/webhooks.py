@@ -56,6 +56,19 @@ async def gitlab_webhook(
     payload = await request.json()
     object_kind = payload.get("object_kind")
 
+    if settings.PROJECT_BRAIN_ENABLED:
+        if not settings.GITLAB_WEBHOOK_SECRET:
+            raise HTTPException(status_code=503, detail="自动知识维护要求配置 GITLAB_WEBHOOK_SECRET")
+        from src.core.project_brain.webhook import handle_brain_event
+
+        # DB 先登记，审查去重/失败不会丢失知识更新；失败返回 503 让 GitLab 重送。
+        try:
+            if await handle_brain_event(payload):
+                return {"status": "ignored", "reason": "verified_project_brain_publication"}
+        except Exception:
+            logger.warning("知识 Webhook 登记失败，请 GitLab 重试")
+            raise HTTPException(status_code=503, detail="知识更新请求暂时无法持久化") from None
+
     if object_kind == "merge_request":
         return _handle_mr(payload)
     elif object_kind == "push":
@@ -80,7 +93,7 @@ def _handle_mr(payload: dict) -> dict:
     mr_iid = attrs.get("iid")
 
     # 防递归：AI-README 自动 MR（由临时分支合并至主分支）不触发任何任务
-    if (
+    if not settings.PROJECT_BRAIN_ENABLED and (
         source_branch.startswith(settings.README_TEMP_BRANCH_PREFIX)
         or mr_title.startswith(settings.README_MR_TITLE_PREFIX)
     ):
@@ -153,7 +166,7 @@ def _handle_push(payload: dict) -> dict:
     project_name = project.get("path_with_namespace", "")
 
     # 防递归：AI-README 临时分支的 push 事件（由 _submit_via_temp_branch_mr 触发）不触发任何任务
-    if branch.startswith(settings.README_TEMP_BRANCH_PREFIX):
+    if not settings.PROJECT_BRAIN_ENABLED and branch.startswith(settings.README_TEMP_BRANCH_PREFIX):
         logger.info(
             "Webhook 事件已忽略: 事件类型=push 项目=%s 分支=%s 原因=AI-README 临时分支 (前缀=%s)",
             project_name, branch, settings.README_TEMP_BRANCH_PREFIX,
@@ -176,7 +189,7 @@ def _handle_push(payload: dict) -> dict:
 
     # 防递归：AI_README 自动提交不触发任何后续任务
     commits = payload.get("commits", [])
-    if commits and all(
+    if not settings.PROJECT_BRAIN_ENABLED and commits and all(
         c.get("message", "").startswith("[AI-README]") for c in commits
     ):
         logger.info(

@@ -23,6 +23,7 @@ def _should_dispatch_readme(
     trigger_type: str,
     mr_action: str | None,
     branch: str,
+    project_id: int | None = None,
 ) -> bool:
     """README 触发矩阵：push 到主分支，或 MR merge action 到主分支。
 
@@ -32,6 +33,8 @@ def _should_dispatch_readme(
     - push 到主分支 或 merge_request+merge 到主分支 → True
     """
     if not settings.README_GENERATION_ENABLED:
+        return False
+    if settings.PROJECT_BRAIN_ENABLED:
         return False
     if branch not in settings.main_branch_list:
         return False
@@ -155,7 +158,7 @@ def run_review(
             logger.error("[review:%d] GitLab 评论发送失败", review_id, exc_info=True)
 
         # 5. 触发文档生成（push 到主分支 或 MR merge 到主分支；失败不影响审查流程）
-        if _should_dispatch_readme(trigger_type, mr_action, branch):
+        if _should_dispatch_readme(trigger_type, mr_action, branch, project_id):
             try:
                 from src.tasks.readme_task import generate_readme
                 generate_readme.delay(

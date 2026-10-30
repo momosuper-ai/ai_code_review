@@ -15,6 +15,7 @@ services:
       - ./src:/app/src
       - repos_data:/data/repos
       - logs_data:/data/logs
+      - brain_data:/data/project_brain:ro
     restart: unless-stopped
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
     logging:
@@ -39,6 +40,81 @@ services:
       - logs_data:/data/logs
     restart: unless-stopped
     command: celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOG_LEVEL:-info} --concurrency=${CELERY_CONCURRENCY:-2} -Q review,celery,readme
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  brain-worker:
+    profiles: ["brain"]
+    build: .
+    env_file: .env
+    environment:
+      PROJECT_BRAIN_WORK_DIR: /data/project_brain_work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - repos_data:/data/repos
+      - logs_data:/data/logs
+      - brain_data:/data/project_brain
+      - brain_work_data:/data/project_brain_work
+    restart: unless-stopped
+    command: celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOG_LEVEL:-info} --concurrency=${PROJECT_BRAIN_CONCURRENCY:-2} -Q brain -n brain@%h
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  celery-beat:
+    profiles: ["brain"]
+    build: .
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - brain_beat_data:/data/beat
+    restart: unless-stopped
+    command: celery -A src.tasks.celery_app beat --loglevel=info --schedule=/data/beat/celerybeat-schedule
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  brain-publisher:
+    profiles: ["brain"]
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/obc_review}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GITLAB_URL: ${GITLAB_URL:-https://gitlab.example.com/}
+      GITLAB_BRAIN_PUBLISH_TOKEN_FILE: /run/secrets/brain_publish_token
+      PROJECT_BRAIN_ENABLED: ${PROJECT_BRAIN_ENABLED:-false}
+      PROJECT_BRAIN_BASE_DIR: /data/project_brain
+      PROJECT_BRAIN_MAX_SOURCE_FILES: ${PROJECT_BRAIN_MAX_SOURCE_FILES:-20000}
+      PROJECT_BRAIN_MR_AUTO_MERGE: ${PROJECT_BRAIN_MR_AUTO_MERGE:-true}
+      PROJECT_BRAIN_TEMP_BRANCH_PREFIX: ${PROJECT_BRAIN_TEMP_BRANCH_PREFIX:-ai-brain/}
+      MAIN_BRANCHES: ${MAIN_BRANCHES:-main,master}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+    secrets:
+      - brain_publish_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - brain_data:/data/project_brain:ro
+    restart: unless-stopped
+    command: celery -A src.tasks.celery_app worker --loglevel=info --concurrency=1 -Q brain-publication -n brain-publisher@%h
     logging:
       driver: "json-file"
       options:
@@ -82,3 +158,9 @@ volumes:
   redisdata:
   repos_data:
   logs_data:
+  brain_data:
+  brain_beat_data:
+  brain_work_data:
+secrets:
+  brain_publish_token:
+    file: ${PROJECT_BRAIN_PUBLISH_TOKEN_PATH:-./secrets/brain_publish_token}

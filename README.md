@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **多维度并行审查**：5 个专业维度 Agent（缺陷/安全/性能/质量/架构）通过 `asyncio.gather` 并行分析，加权评分合并
+- **Project Brain 项目知识**（默认关闭）：与审查共用 Webhook；主分支变动自动首建、后续增量维护，固定 SHA 的事实、六类证据卡片及版本下载。写回边界为 `PROJECT_BRAIN.md` 与 `docs/project-brain/`，目录内可自由命名；独立 Publisher 校验所有权、内容和差异。启用后接管旧 AI_README 生成。[配置、部署与回滚说明](docs/project-brain.md)
 - **智能 Agent 模式**：每个维度 Agent 独立 tool-calling 循环，可自主查阅代码上下文以做出准确判断
 - **安全沙箱**：LLM 只能通过 6 个受限工具（read_file, search_code, list_directory, find_definition, get_file_info, get_blast_radius）访问被审查项目的代码
 - **隐私过滤**：规则引擎 + LLM 混合扫描，3 阶段流水线（预扫描 -> 工具结果扫描 -> 反脱敏）自动保护敏感数据
@@ -777,3 +778,21 @@ docker-compose exec api alembic upgrade head   # 首次启用需确保 readme_re
 - [LICENSE](LICENSE) — MIT License
 
 **架构与设计决策记录**：详见 `CLAUDE.md` / `AGENTS.md`（两个文件内容同步），其中记录了多维度审查、隐私过滤流水线、影响面预分析、受保护主分支绕过流程、防递归三层防御、"README 链路不发邮件"结构不变量等关键设计决策。
+
+## WSL 本机验证
+
+Project Brain 可先在独立 WSL/Docker 环境验证，默认端口 18080、关闭 GitLab 写回和审查 Worker。仅在试点项目配置同一 Webhook 即可自动首建；见 [完整本机验证步骤](docs/project-brain-local-test.md)。
+
+成本优化保留完整事实、关系和证据，使用语义字段复用、紧凑上下文及可恢复预算控制；实际 Token、费用估算与质量验证口径见 [成本与质量控制](docs/project-brain-cost.md)。正式知识需通过源码和证据校验，不能把结构通过当作业务理解正确。
+
+知识概览按模块归并，再由完整模块集合形成项目概览；完整解释、未知项和来源同时保留，概览仍标注为待独立核验的 AI 推断。首层模块解释读取完整符号关系，上层使用明确标注的解析状态统计视图；具体依赖与调用路径仍需查阅详细知识和完整图。独立规划任务在已校验输出保存后推进下一层，规划失败不会回滚付费生成结果。任务恢复、综合协议和质量验收见 [分层汇总说明](docs/project-brain-hierarchy.md)。
+
+隐私发现只在 Worker 私有卷保存不可逆来源。原提交含硬编码凭证及同值路径时，使用私有规范身份和安全公开投影，遮蔽显示路径并关闭原始直链；源码SHA、blob和行范围仍可认证。新构建先继承同项目已认证发现，规则发现也跨单元持久保存；缺失索引、历史材料或封存不一致时停止，不能以空结果撤销已有发现。汇总在完整来源认证后减少机器字段的重复分类，全部解释、未知项与展示路径继续扫描，完整原包仍重放规则和HMAC。详见[敏感来源设计](docs/project-brain-sensitive-source-design.md)、[历史发现继承](docs/project-brain-privacy-inheritance.md)、[汇总隐私投影](docs/project-brain-summary-privacy.md)及[验收记录](docs/project-brain-sensitive-source-validation.md)。
+
+迁移`007_brain_usage`后，新构建提供`GET /api/v1/projects/{project_id}/brain/builds/{build_id}/usage`，按隐私/语义模型、阶段与用途查询实际或估算用量；旧记录保留总量，不推算模型占比。并发、未知预留与部署顺序见 [分模型用量](docs/project-brain-model-usage.md)。
+
+2.1.0 通过迁移 `008_brain_http` 提供显式有界 HTTP 恢复。临时网关错误逐次计量和退避，失败费用上界保留，输出隐私扫描恢复时保留原语义响应；超时或响应丢失仍停止。见 [模型 HTTP 重试与封存约束](docs/project-brain-http-retry.md)。
+
+2.2.0 增加迁移 `009_brain_recovery` 和认证检查点恢复。局部传输修复可继承兼容的成功扫描与编译结果，只重做失效或未完成部分；新旧调用、来源和费用分别保留。见 [恢复规则、历史证明与接口](docs/project-brain-checkpoint-recovery.md)。
+
+2.2.1 修复恢复读取时的软超时误分类和当前隐私索引并发读取问题，保留原认证及费用门禁。见 [中断处理与运行边界](docs/project-brain-interrupt-recovery.md)。

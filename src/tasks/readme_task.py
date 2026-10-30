@@ -43,6 +43,9 @@ def generate_readme(
     )
     task_start = time.time()
 
+    if settings.PROJECT_BRAIN_ENABLED:
+        return {"status": "skipped", "reason": "project_brain_enabled"}
+
     # 入口幂等：同 (project_id, branch, commit_sha) 已有 completed 记录则跳过
     if _has_completed_readme(project_id, branch, commit_sha):
         logger.info(

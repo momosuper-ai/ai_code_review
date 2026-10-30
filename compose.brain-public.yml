@@ -1,0 +1,37 @@
+# Optional, outbound-only public webhook entry for the isolated local test stack.
+services:
+  brain-webhook-proxy:
+    profiles: [tunnel]
+    image: nginx@sha256:1d13701a5f9f3fb01aaa88cef2344d65b6b5bf6b7d9fa4cf0dca557a8d7702ba
+    user: "101:101"
+    entrypoint: [nginx, -c, /etc/nginx/brain-public.conf, -g, "daemon off;"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:uid=101,gid=101,mode=700"]
+    volumes: ["./scripts/brain_public_nginx.conf:/etc/nginx/brain-public.conf:ro"]
+    depends_on:
+      api: {condition: service_started}
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  brain-tunnel:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+    command: [tunnel, --no-autoupdate, --protocol, http2, --url, "http://brain-webhook-proxy:8080"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      brain-webhook-proxy: {condition: service_healthy}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}

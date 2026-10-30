@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from src.config import settings
 from src.models import Base
 from src.models.review import Review, ReviewComment  # noqa: F401
+from src.models.readme_record import ReadmeRecord  # noqa: F401
+from src.models.brain import BrainBuild, BrainModelCall, BrainProject, BrainPublication, BrainUnit  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

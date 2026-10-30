@@ -1,5 +1,5 @@
 from celery import Celery
-from celery.signals import worker_init
+from celery.signals import worker_init, worker_process_init
 
 from src.config import settings
 
@@ -16,16 +16,33 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=True,
     task_track_started=True,
+    worker_prefetch_multiplier=1,
     task_routes={
         "src.tasks.review_task.run_review": {"queue": "review"},
         "src.tasks.readme_task.generate_readme": {"queue": "readme"},
+        "src.tasks.brain_task.*": {"queue": "brain"},
+        "src.tasks.brain_publication_task.*": {"queue": "brain-publication"},
+    },
+    beat_schedule={
+        "project-brain-recovery": {"task": "src.tasks.brain_task.recover_brain", "schedule": 15.0, "options": {"queue": "brain"}},
     },
 )
 
 celery_app.conf.include = [
     "src.tasks.review_task",
     "src.tasks.readme_task",
+    "src.tasks.brain_task",
+    "src.tasks.brain_publication_task",
 ]
+
+
+@worker_process_init.connect
+def initialize_worker_database_pool(**kwargs: object) -> None:
+    """每个子进程建立自己的连接池，不复用启动检查的父进程连接。"""
+    from src.models import sync_engine
+
+    # 不关闭父进程拥有的连接；保留 Engine/Session 工厂，仅替换子进程的池。
+    sync_engine.dispose(close=False)
 
 
 @worker_init.connect

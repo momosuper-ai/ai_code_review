@@ -10,6 +10,7 @@ from openai import AsyncOpenAI, APIConnectionError, APIStatusError, BadRequestEr
 from openai.types.chat import ChatCompletionMessage
 
 from src.config import settings
+from src.core.http_transport import TIMEOUT_PHASES
 from src.utils.logger import logger
 
 
@@ -34,20 +35,46 @@ class TokenUsage:
 class ChatResult:
     message: ChatCompletionMessage
     usage: TokenUsage
+    finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    reasoning_chars: int = 0
+    response_model: str | None = None
 
 
 # Sentinel：未传 response_format 时走自动决策；显式传 None 表示禁用；显式传 dict 表示透传
 _RESPONSE_FORMAT_AUTO = object()
+_EXTRA_BODY_AUTO = object()
+
+
+def _transport_phase(exc: BaseException) -> str:
+    """Classify a bounded exception chain without inspecting provider text."""
+    pending, seen = [exc], set()
+    while pending and len(seen) < 16:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for kind, phase in TIMEOUT_PHASES:
+            if isinstance(current, kind):
+                return phase
+        # The SDK wraps httpx failures. Only inspect exception identity/types;
+        # messages and request/response objects may contain credentials.
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException) and id(linked) not in seen:
+                pending.append(linked)
+    return "unknown"
 
 
 class LLMClient:
-    def __init__(self, model_name: str | None = None):
-        self._client = AsyncOpenAI(
-            base_url=settings.VLLM_API_URL,
-            api_key=settings.VLLM_API_KEY,
-        )
+    def __init__(self, model_name: str | None = None, sdk_retries: int | None = None,
+                 metadata_errors: bool = False):
+        client_options = {"base_url": settings.VLLM_API_URL, "api_key": settings.VLLM_API_KEY}
+        if sdk_retries is not None:
+            client_options["max_retries"] = sdk_retries
+        self._client = AsyncOpenAI(**client_options)
         self._model = model_name or settings.VLLM_MODEL_NAME
         self._privacy_filter = None  # PrivacyFilter | None
+        self._metadata_errors = metadata_errors
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_cached_tokens = 0
@@ -76,6 +103,9 @@ class LLMClient:
         max_tokens: int | None = None,
         response_format=_RESPONSE_FORMAT_AUTO,
         json_schema_builder=None,
+        extra_body=_EXTRA_BODY_AUTO,
+        retry_max: int | None = None,
+        tool_choice: str | dict | None = None,
     ) -> ChatResult:
         """Send a chat completion request, optionally with tools.
 
@@ -89,6 +119,9 @@ class LLMClient:
 
         json_schema_builder: callable 返回完整 {'type':'json_schema',...} dict，
         仅在 mode=json_schema 自动决策时使用；缺失会降级为 json_object。
+        extra_body: 默认沿用全局配置，dict 替换本次配置，None 禁用。
+        retry_max: 默认沿用全局重试次数；Brain 由持久任务控制重试并逐次预留预算。
+        tool_choice: 可显式选择结构化输出函数；未传时原工具循环保持 auto。
         """
         from src.core.context_manager import trim_messages
         from src.core.dimensions import build_response_format
@@ -110,7 +143,9 @@ class LLMClient:
         }
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+        elif tool_choice is not None:
+            raise ValueError("指定输出函数时必须提供工具定义")
 
         # 决定本次调用的 response_format
         if response_format is _RESPONSE_FORMAT_AUTO:
@@ -128,15 +163,21 @@ class LLMClient:
             kwargs["response_format"] = final_rf
 
         # 模型特性透传（thinking / reasoning_effort 等，由 .env 配置）
-        if settings.LLM_EXTRA_BODY:
+        if extra_body is _EXTRA_BODY_AUTO and settings.LLM_EXTRA_BODY:
             try:
-                extra_body = json.loads(settings.LLM_EXTRA_BODY)
-                if isinstance(extra_body, dict):
-                    kwargs["extra_body"] = extra_body
+                configured_body = json.loads(settings.LLM_EXTRA_BODY)
+                if isinstance(configured_body, dict):
+                    kwargs["extra_body"] = configured_body
             except json.JSONDecodeError:
-                logger.warning("LLM_EXTRA_BODY 解析失败，忽略: %s", settings.LLM_EXTRA_BODY)
+                logger.warning("LLM_EXTRA_BODY 解析失败，忽略该配置")
+        elif extra_body is not _EXTRA_BODY_AUTO and extra_body is not None:
+            if not isinstance(extra_body, dict):
+                raise ValueError("LLM 扩展参数必须是对象或 None")
+            kwargs["extra_body"] = extra_body
 
-        max_retries = settings.LLM_RETRY_MAX
+        max_retries = settings.LLM_RETRY_MAX if retry_max is None else retry_max
+        if max_retries < 0:
+            raise ValueError("LLM 重试次数不能小于零")
 
         for attempt in range(max_retries + 1):
             try:
@@ -172,20 +213,36 @@ class LLMClient:
                         "LLM 输出可能被截断: completion=%d ≥ 95%% of max_tokens=%d, finish_reason=%s",
                         usage.completion_tokens, max_tokens, finish,
                     )
-                return ChatResult(message=response.choices[0].message, usage=call_usage)
+                details = getattr(usage, "completion_tokens_details", None) if usage else None
+                return ChatResult(message=response.choices[0].message, usage=call_usage,
+                                  response_model=getattr(response, "model", None),
+                                  finish_reason=getattr(response.choices[0], "finish_reason", None),
+                                  reasoning_tokens=getattr(details, "reasoning_tokens", None),
+                                  reasoning_chars=sum(len(getattr(response.choices[0].message, key, "") or "")
+                                                      for key in ("reasoning", "reasoning_content")
+                                                      if isinstance(getattr(response.choices[0].message, key, ""), str)))
             except Exception as exc:
                 if attempt < max_retries and self._is_retryable(exc):
                     delay = min(
                         settings.LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random(),
                         settings.LLM_RETRY_MAX_DELAY,
                     )
-                    logger.warning(
-                        "LLM API 调用失败 (可重试), 第 %d/%d 次重试, %.1f秒后重试: %s: %s",
-                        attempt + 1, max_retries, delay, type(exc).__name__, exc,
-                    )
+                    if self._metadata_errors:
+                        logger.warning("LLM API 调用失败 (可重试): 第 %d/%d 次重试 延迟=%.1f 错误类型=%s HTTP状态=%s transport_phase=%s",
+                                       attempt + 1, max_retries, delay, type(exc).__name__, getattr(exc, "status_code", None),
+                                       _transport_phase(exc))
+                    else:
+                        logger.warning(
+                            "LLM API 调用失败 (可重试), 第 %d/%d 次重试, %.1f秒后重试: %s: %s",
+                            attempt + 1, max_retries, delay, type(exc).__name__, exc,
+                        )
                     await asyncio.sleep(delay)
                     continue
-                logger.error("LLM API 调用失败: 模型=%s 错误类型=%s 错误=%s", self._model, type(exc).__name__, exc)
+                if self._metadata_errors:
+                    logger.error("LLM API 调用失败: 模型=%s 错误类型=%s HTTP状态=%s transport_phase=%s",
+                                 self._model, type(exc).__name__, getattr(exc, "status_code", None), _transport_phase(exc))
+                else:
+                    logger.error("LLM API 调用失败: 模型=%s 错误类型=%s 错误=%s", self._model, type(exc).__name__, exc)
                 raise
 
     async def aclose(self):

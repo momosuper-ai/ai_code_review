@@ -1,3 +1,7 @@
+import json
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -11,6 +15,8 @@ class Settings(BaseSettings):
     # GitLab
     GITLAB_URL: str = "https://gitlab.example.com/"
     GITLAB_TOKEN: str = ""
+    GITLAB_READ_TOKEN: str = ""
+    GITLAB_BRAIN_PUBLISH_TOKEN_FILE: str = ""
     GITLAB_WEBHOOK_SECRET: str = ""
 
     # vLLM
@@ -121,6 +127,80 @@ class Settings(BaseSettings):
     README_MR_AUTO_MERGE: bool = True
     README_MR_AUTO_MERGE_REMOVE_BRANCH: bool = True
     README_MR_DESCRIPTION: str = "Automated AI_README.md update. Safe to merge."
+
+    # Project Brain（OpenViking 和审查消费在后续阶段接入）
+    PROJECT_BRAIN_ENABLED: bool = False
+    PROJECT_BRAIN_BASE_DIR: str = "/data/project_brain"
+    PROJECT_BRAIN_WORK_DIR: str = ""
+    PROJECT_BRAIN_MODEL_NAME: str = ""
+    PROJECT_BRAIN_CONCURRENCY: int = Field(2, ge=1, le=16)
+    PROJECT_BRAIN_PACKET_MAX_TOKENS: int = Field(32000, ge=2048)
+    PROJECT_BRAIN_LLM_MAX_TOKENS: int = Field(4096, ge=256)
+    PROJECT_BRAIN_LLM_RETRY_MAX_TOKENS: int = Field(16384, ge=256)
+    PROJECT_BRAIN_PRIVACY_PACKET_MAX_TOKENS: int = Field(6000, ge=1024)
+    PROJECT_BRAIN_PRIVACY_MAX_FIELD_TOKENS: int = Field(32000, ge=1024)
+    PROJECT_BRAIN_PRIVACY_MAX_RECORDS_PER_PACKET: int = Field(100, ge=1, le=100)
+    PROJECT_BRAIN_PRIVACY_LLM_MAX_TOKENS: int = Field(4096, ge=256)
+    PROJECT_BRAIN_PRIVACY_MAX_CALLS_PER_UNIT: int = Field(8, ge=1, le=16)
+    PROJECT_BRAIN_PRIVACY_OUTPUT_MAX_CALLS_PER_UNIT: int = Field(64, ge=1, le=128)
+    PROJECT_BRAIN_PRIVACY_CALL_TIMEOUT: int = Field(60, ge=5, le=120)
+    PROJECT_BRAIN_MODEL_HTTP_RETRIES: int = Field(2, ge=0, le=4)
+    PROJECT_BRAIN_PRIVACY_EXTRA_BODY: str = ""
+    PROJECT_BRAIN_SEMANTIC_EXTRA_BODY: str = ""
+    PROJECT_BRAIN_SEMANTIC_OUTPUT_MODE: Literal["auto", "strict_tool", "source_bound"] = "auto"
+    PROJECT_BRAIN_MAX_EXPLANATION_SLOTS: int = Field(24, ge=1, le=64)
+    PROJECT_BRAIN_MAX_BUILD_TOKENS: int = Field(500000, ge=4096)
+    PROJECT_BRAIN_MAX_SOURCE_FILES: int = Field(20000, ge=1)
+    PROJECT_BRAIN_DEBOUNCE_SECONDS: int = Field(60, ge=0, le=300)
+    PROJECT_BRAIN_RECONCILE_SECONDS: int = Field(300, ge=30)
+    PROJECT_BRAIN_GITLAB_SYNC: bool = True
+    PROJECT_BRAIN_MR_AUTO_MERGE: bool = True
+    PROJECT_BRAIN_TEMP_BRANCH_PREFIX: str = "ai-brain/"
+    PROJECT_BRAIN_RETENTION_BUILDS: int = Field(10, ge=1)
+
+    @property
+    def brain_model_name(self) -> str:
+        """返回知识生成使用的模型，沿用审查的双模型选择规则。"""
+        if self.PROJECT_BRAIN_MODEL_NAME:
+            return self.PROJECT_BRAIN_MODEL_NAME
+        if self.PRIVACY_FILTER_ENABLED and self.CLOUD_LLM_MODEL_NAME:
+            return self.CLOUD_LLM_MODEL_NAME
+        return self.VLLM_MODEL_NAME
+
+    @field_validator("PROJECT_BRAIN_PRIVACY_EXTRA_BODY")
+    @classmethod
+    def validate_brain_privacy_extra_body(cls, value: str) -> str:
+        """Fail closed on malformed privacy-model protocol parameters."""
+        if value.strip():
+            try:
+                body = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("知识隐私模型扩展参数必须为 JSON 对象") from exc
+            if not isinstance(body, dict):
+                raise ValueError("知识隐私模型扩展参数必须为 JSON 对象")
+        return value
+
+    @field_validator("PROJECT_BRAIN_SEMANTIC_EXTRA_BODY")
+    @classmethod
+    def validate_brain_semantic_extra_body(cls, value: str) -> str:
+        """Validate parameters scoped to Brain semantic compilation."""
+        if value.strip():
+            try:
+                body = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("知识语义模型扩展参数必须为 JSON 对象") from exc
+            if not isinstance(body, dict):
+                raise ValueError("知识语义模型扩展参数必须为 JSON 对象")
+        return value
+
+    @model_validator(mode="after")
+    def validate_brain_capacity_limits(self) -> "Settings":
+        """Validate independent batch, complete-field and retry ceilings."""
+        if self.PROJECT_BRAIN_PRIVACY_MAX_FIELD_TOKENS < self.PROJECT_BRAIN_PRIVACY_PACKET_MAX_TOKENS:
+            raise ValueError("知识隐私单字段上限不能小于普通包上限")
+        if self.PROJECT_BRAIN_LLM_RETRY_MAX_TOKENS < self.PROJECT_BRAIN_LLM_MAX_TOKENS:
+            raise ValueError("知识语义恢复上限不能小于初始输出上限")
+        return self
 
     # SonarQube（预留）
     SONARQUBE_URL: str = ""

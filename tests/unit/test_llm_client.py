@@ -54,6 +54,45 @@ async def test_chat_does_not_inject_when_tools_present(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_can_force_a_structured_output_function(monkeypatch):
+    monkeypatch.setattr("src.config.settings.VLLM_MODEL_NAME", "test-model")
+    monkeypatch.setattr("src.config.settings.CLOUD_LLM_MODEL_NAME", "")
+    client = LLMClient("test-model")
+    client._client.chat.completions.create = AsyncMock(return_value=_fake_response(tool_calls=[]))
+    tool = {"type": "function", "function": {"name": "emit_knowledge", "parameters": {}}}
+    choice = {"type": "function", "function": {"name": "emit_knowledge"}}
+    await client.chat([{"role": "user", "content": "合成结构化输出"}], tools=[tool], tool_choice=choice)
+    assert client._client.chat.completions.create.await_args.kwargs["tool_choice"] == choice
+
+
+@pytest.mark.asyncio
+async def test_chat_cannot_force_a_function_without_definition(monkeypatch):
+    monkeypatch.setattr("src.config.settings.VLLM_MODEL_NAME", "test-model")
+    monkeypatch.setattr("src.config.settings.CLOUD_LLM_MODEL_NAME", "")
+    client = LLMClient("test-model")
+    client._client.chat.completions.create = AsyncMock()
+    with pytest.raises(ValueError, match="必须提供工具定义"):
+        await client.chat([{"role": "user", "content": "合成结构化输出"}], tool_choice="required")
+    client._client.chat.completions.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_brain_metadata_errors_never_log_provider_body(monkeypatch):
+    from src.utils.logger import logger
+
+    messages = []
+    private = "synthetic-private-provider-response"
+    monkeypatch.setattr(logger, "error", lambda template, *args: messages.append(template % args))
+    client = LLMClient("synthetic-model", sdk_retries=0, metadata_errors=True)
+    client._client.chat.completions.create = AsyncMock(side_effect=RuntimeError(private))
+    with pytest.raises(RuntimeError):
+        await client.chat([{"role": "user", "content": "合成输入"}], retry_max=0)
+    assert any("RuntimeError" in message for message in messages)
+    assert all(private not in message for message in messages)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_chat_response_format_none_disables(monkeypatch):
     """显式传 response_format=None 用于 README 等 Markdown 输出场景，应禁用注入。"""
     monkeypatch.setattr("src.config.settings.LLM_RESPONSE_FORMAT_MODE", "json_object")

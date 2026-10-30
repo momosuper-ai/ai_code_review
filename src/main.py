@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
         try:
             await asyncio.to_thread(ensure_database_exists)
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                await conn.run_sync(lambda sync: Base.metadata.create_all(sync, tables=[Review.__table__, ReviewComment.__table__, ReadmeRecord.__table__]))
             logger.info("数据库表初始化完成")
             break
         except Exception as exc:

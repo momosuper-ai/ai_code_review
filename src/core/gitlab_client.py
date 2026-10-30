@@ -1,5 +1,9 @@
 import time
+from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
+
+import base64
 
 import httpx
 
@@ -10,10 +14,23 @@ _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
 class GitLabClient:
-    def __init__(self):
+    def __init__(self, purpose: Literal["review", "read", "brain_publish"] = "review") -> None:
+        """发布凭据只在专用进程按用途加载，其他调用使用读取/评论身份。"""
         base = settings.GITLAB_URL.rstrip("/")
         self._base = f"{base}/api/v4"
-        self._headers = {"PRIVATE-TOKEN": settings.GITLAB_TOKEN}
+        self._purpose = purpose
+        token = (settings.GITLAB_READ_TOKEN or settings.GITLAB_TOKEN) if purpose == "read" else settings.GITLAB_TOKEN
+        if purpose == "brain_publish":
+            if not settings.GITLAB_BRAIN_PUBLISH_TOKEN_FILE:
+                raise ValueError("知识发布凭据文件尚未配置")
+            token = Path(settings.GITLAB_BRAIN_PUBLISH_TOKEN_FILE).read_text(encoding="utf-8").strip()
+            if not token:
+                raise ValueError("知识发布凭据文件为空")
+        self._headers = {"PRIVATE-TOKEN": token}
+
+    def _require_writer(self) -> None:
+        if self._purpose == "read" or (settings.PROJECT_BRAIN_ENABLED and self._purpose != "brain_publish"):
+            raise ValueError("当前 GitLab 身份不允许修改仓库或知识 MR")
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -21,6 +38,83 @@ class GitLabClient:
             headers=self._headers,
             timeout=_TIMEOUT,
         )
+
+    async def brain_request(self, method: str, path: str, **kwargs) -> dict | list:
+        """只读知识 API，写入必须通过有约束的专用方法。"""
+        if method != "GET":
+            raise ValueError("通用知识 API 只允许 GET")
+        async with self._client() as client:
+            response = await client.request(method, path, **kwargs)
+            response.raise_for_status()
+            return response.json()
+
+    async def get_repository_file(self, project_id: int, path: str, ref: str) -> dict | None:
+        """读取文档及文件级并发校验字段，404 表示尚未创建。"""
+        async with self._client() as client:
+            response = await client.get(f"/projects/{project_id}/repository/files/{quote(path, safe='')}", params={"ref": ref})
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            data = response.json()
+            data["decoded_content"] = base64.b64decode(data["content"]).decode("utf-8")
+            return data
+
+    async def create_brain_commit(self, project_id: int, branch: str, build_id: str, actions: list[dict],
+                                  verified_files: dict[str, str], owned_deletions: set[str]) -> dict:
+        """仅提交已验证的知识清单，保留 README 入口原有文件限制。"""
+        from src.core.project_brain.artifacts import owned_path
+
+        seen = set()
+        for action in actions:
+            path = action.get("file_path", "")
+            if not owned_path(path) or path in seen or set(action) - {"action", "file_path", "content", "last_commit_id"}:
+                raise ValueError("知识提交包含非法路径或字段")
+            seen.add(path)
+            kind = action.get("action")
+            if kind == "delete":
+                if path not in owned_deletions or not action.get("last_commit_id"):
+                    raise ValueError("知识删除动作缺少所有权或并发校验")
+            elif kind in {"create", "update"}:
+                if path not in verified_files or action.get("content") != verified_files[path]:
+                    raise ValueError("提交内容不在已验证清单中")
+                if kind == "update" and not action.get("last_commit_id"):
+                    raise ValueError("知识更新缺少文件并发校验")
+            else:
+                raise ValueError("知识提交动作无效")
+        if not actions:
+            return {}
+        self._require_writer()
+        async with self._client() as client:
+            response = await self._post_commit(client, project_id, branch, f"[AI-BRAIN] 更新项目知识 ({build_id})",
+                                               actions, "Project Brain Bot", "ai-brain@noreply.local")
+            response.raise_for_status()
+            return response.json()
+
+    async def merge_brain_mr(self, project_id: int, iid: int, sha: str) -> dict:
+        """按 GitLab 版本启用自动合并，始终核对源分支 SHA。"""
+        self._require_writer()
+        version = await self.brain_request("GET", "/version")
+        numbers = str(version["version"]).split(".")
+        current = tuple(int(__import__("re").match(r"\d+", n).group()) for n in numbers[:2])
+        parameter = "auto_merge" if current >= (17, 11) else "merge_when_pipeline_succeeds"
+        async with self._client() as client:
+            response = await client.put(f"/projects/{project_id}/merge_requests/{iid}/merge",
+                                        json={"sha": sha, "should_remove_source_branch": True, parameter: True})
+            if response.status_code in {403, 405, 406, 409, 422}:
+                return {}
+            response.raise_for_status()
+            return response.json()
+
+    async def close_brain_mr(self, project_id: int, iid: int, build_id: str, source_branch: str) -> None:
+        """只关闭有对应构建标记和确定源分支的服务 MR。"""
+        self._require_writer()
+        mr = await self.brain_request("GET", f"/projects/{project_id}/merge_requests/{iid}")
+        if (mr.get("state") != "opened" or mr.get("source_branch") != source_branch
+                or f"<!-- project-brain:{build_id} -->" not in (mr.get("description") or "")):
+            raise ValueError("MR 不属于该知识发布")
+        async with self._client() as client:
+            response = await client.put(f"/projects/{project_id}/merge_requests/{iid}", json={"state_event": "close"})
+            response.raise_for_status()
 
     async def get_mr_changes(self, project_id: int, mr_iid: int) -> dict:
         """GET /projects/:id/merge_requests/:iid/changes"""
@@ -212,6 +306,13 @@ class GitLabClient:
         author_email: str,
     ) -> httpx.Response:
         """发送一次 POST /repository/commits 请求，返回原始响应对象。"""
+        self._require_writer()
+        if settings.PROJECT_BRAIN_ENABLED:
+            from src.core.project_brain.artifacts import owned_path
+
+            if any(not owned_path(action.get("file_path", "")) or action.get("action") not in {"create", "update", "delete"}
+                   or set(action) - {"action", "file_path", "content", "last_commit_id"} for action in actions):
+                raise ValueError("最终提交包含目录边界以外的修改")
         t0 = time.time()
         payload: dict = {
             "branch": branch,
@@ -252,6 +353,10 @@ class GitLabClient:
         兜底：若 GitLab 返回 400 且错误消息指示 create/update 类型不匹配
         （例如 "A file with this name already exists"），会自动翻转 action 重试一次。
         """
+        # 最终写入闸门也拦截已经开始生成的旧任务。
+        if settings.PROJECT_BRAIN_ENABLED:
+            raise ValueError("Project Brain 模式已停用旧 README 写入入口")
+        self._require_writer()
         # 安全校验：只允许提交 AI_README.md 文件
         for act in actions:
             file_path = act.get("file_path", "")
@@ -319,6 +424,9 @@ class GitLabClient:
 
         幂等：若分支已存在（400 + "already exists"），返回空 dict + info 日志。
         """
+        self._require_writer()
+        if settings.PROJECT_BRAIN_ENABLED and not branch.startswith(settings.PROJECT_BRAIN_TEMP_BRANCH_PREFIX):
+            raise ValueError("知识发布只能创建专用临时分支")
         async with self._client() as c:
             t0 = time.time()
             resp = await c.post(
@@ -351,6 +459,9 @@ class GitLabClient:
 
         清理失败不抛异常，仅记录 warning。
         """
+        self._require_writer()
+        if settings.PROJECT_BRAIN_ENABLED and not branch.startswith(settings.PROJECT_BRAIN_TEMP_BRANCH_PREFIX):
+            raise ValueError("知识发布只能删除专用临时分支")
         encoded = quote(branch, safe="")
         async with self._client() as c:
             t0 = time.time()
@@ -386,6 +497,10 @@ class GitLabClient:
         squash: bool = True,
     ) -> dict:
         """POST /projects/:id/merge_requests"""
+        self._require_writer()
+        if settings.PROJECT_BRAIN_ENABLED and (not source_branch.startswith(settings.PROJECT_BRAIN_TEMP_BRANCH_PREFIX)
+                                                or target_branch not in settings.main_branch_list):
+            raise ValueError("知识 MR 分支不在发布范围内")
         payload = {
             "source_branch": source_branch,
             "target_branch": target_branch,
@@ -427,6 +542,9 @@ class GitLabClient:
 
         405/406/409（冲突、未就绪、需审批）仅 warning 并返回空 dict，由上层决定降级。
         """
+        if settings.PROJECT_BRAIN_ENABLED:
+            raise ValueError("知识模式要求使用带源 SHA 的专用合并入口")
+        self._require_writer()
         payload = {
             "should_remove_source_branch": should_remove_source_branch,
             "merge_when_pipeline_succeeds": merge_when_pipeline_succeeds,

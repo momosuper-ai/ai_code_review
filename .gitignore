@@ -3,6 +3,8 @@
 
 # Environment variables (contains secrets)
 .env
+.env.brain-local
+secrets/
 
 # Retired local infra images (kept on disk, not published)
 sonarqube/

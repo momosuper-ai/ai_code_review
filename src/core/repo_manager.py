@@ -2,11 +2,16 @@ import asyncio
 import os
 import subprocess
 import time
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from filelock import FileLock
 
 from src.config import settings
 from src.utils.logger import logger
+
+if TYPE_CHECKING:
+    from src.core.project_brain.snapshot import RepoSnapshot
 
 
 class RepoManager:
@@ -35,13 +40,14 @@ class RepoManager:
     def _credential_url(self, project_path: str) -> str:
         """Build clone URL with embedded OAuth2 token."""
         base = settings.GITLAB_URL.rstrip("/")
+        token = settings.GITLAB_READ_TOKEN or settings.GITLAB_TOKEN
         # https://oauth2:TOKEN@host/path.git
         if base.startswith("https://"):
             host_path = base[len("https://"):]
-            return f"https://oauth2:{settings.GITLAB_TOKEN}@{host_path}/{project_path}.git"
+            return f"https://oauth2:{token}@{host_path}/{project_path}.git"
         elif base.startswith("http://"):
             host_path = base[len("http://"):]
-            return f"http://oauth2:{settings.GITLAB_TOKEN}@{host_path}/{project_path}.git"
+            return f"http://oauth2:{token}@{host_path}/{project_path}.git"
         return self._clone_url(project_path)
 
     def _run_git(self, args: list[str], cwd: str | None = None) -> str:
@@ -112,3 +118,38 @@ class RepoManager:
                 )
 
         await asyncio.to_thread(_sync)
+
+    async def ensure_snapshot(
+        self, project_id: int, project_path: str, branch: str,
+        commit_sha: str, destination: str,
+    ) -> "RepoSnapshot":
+        """导出固定 SHA 的凭据隔离快照，不修改审查工作目录。"""
+        from src.core.project_brain.snapshot import RepoSnapshot, export_snapshot, run_git, safe_relative
+
+        if project_id <= 0:
+            raise ValueError("GitLab 项目 ID 无效")
+        safe_relative(project_path)
+        import re
+
+        if not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", commit_sha):
+            raise ValueError("必须提供完整提交 SHA")
+
+        def _snapshot() -> RepoSnapshot:
+            run_git(["check-ref-format", "--branch", branch])
+            cache = Path(self.base_dir) / ".brain-cache" / f"{project_id}.git"
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(str(cache) + ".lock"):
+                if not cache.exists():
+                    run_git(["clone", "--bare", "--", self._credential_url(project_path), str(cache)])
+                run_git(["fetch", "origin", f"+refs/heads/{branch}:refs/heads/{branch}"], cache)
+                try:
+                    run_git(["cat-file", "-e", f"{commit_sha}^{{commit}}"], cache)
+                except RuntimeError:
+                    import re
+
+                    if not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", commit_sha):
+                        raise ValueError("必须提供完整提交 SHA")
+                    run_git(["fetch", "origin", commit_sha], cache)
+                return export_snapshot(cache, Path(destination), commit_sha, settings.PROJECT_BRAIN_MAX_SOURCE_FILES)
+
+        return await asyncio.to_thread(_snapshot)

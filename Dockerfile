@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
@@ -38,3 +38,11 @@ RUN pip install --no-cache-dir --no-deps .
 
 EXPOSE 8000
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# 独立本机测试镜像；默认 production 阶段仍不包含测试依赖。
+FROM runtime AS local-test
+RUN pip install --no-cache-dir '.[dev]'
+COPY tests/ ./tests/
+COPY scripts/ ./scripts/
+
+FROM runtime AS production

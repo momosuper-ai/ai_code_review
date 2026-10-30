@@ -1,0 +1,5 @@
+{
+  "publisher_gl_ids": ["user-1234"],
+  "target_branches": ["main", "master"],
+  "temp_branch_prefix": "ai-brain/"
+}
