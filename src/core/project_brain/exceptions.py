@@ -90,13 +90,18 @@ class ModelWorkAdmissionDenied(Exception):
 
     failure_code = "model_work_window_exhausted"
 
-    def __init__(self, reason: str, phase: str, *, after_response: bool) -> None:
+    def __init__(self, reason: str, phase: str, *, after_response: bool,
+                 remaining_seconds: int | None = None, required_seconds: int | None = None) -> None:
         if (type(reason) is not str or reason not in {"deadline", "call_limit"}
                 or type(phase) is not str or phase not in {"before_prepare", "before_reserve", "after_reserve"}
-                or type(after_response) is not bool):
+                or type(after_response) is not bool
+                or remaining_seconds is not None and (type(remaining_seconds) is not int or remaining_seconds < 0)
+                or required_seconds is not None and (type(required_seconds) is not int or required_seconds < 0)):
             raise ValueError("模型工作准入诊断字段无效")
         self.reason = reason
         self.phase = phase
         self.after_response = after_response
         self.reservation_created = phase == "after_reserve"
+        self.remaining_seconds = remaining_seconds
+        self.required_seconds = required_seconds
         super().__init__(self.failure_code)

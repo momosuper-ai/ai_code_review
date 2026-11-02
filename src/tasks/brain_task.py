@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -13,11 +13,12 @@ from sqlalchemy import Text, cast, func, or_, select
 from src.config import settings
 from src.core.gitlab_client import GitLabClient
 from src.core.project_brain import GENERATOR_VERSION
+from src.core.project_brain import timing
 from src.core.project_brain.artifacts import ArtifactStore, assemble_cards, validate
 from src.core.project_brain.compiler import CompilationGuard, CompilationLimitError, compile_packet, encoded, packet_hash, packets, sanitize_structure
 from src.core.project_brain.extractor import FactExtractor
 from src.core.project_brain.exceptions import ModelCallsIncomplete, ModelTransportFailed, ModelWorkAdmissionDenied, PrivacyCheckpointMissing, PrivacyIdentityConflict, PrivacySealConflict, SourceBindingError, PrivacyResponseInvalid
-from src.core.project_brain.execution import finish_pause
+from src.core.project_brain.execution import ExecutionConflict, finish_pause, pause_build
 from src.core.project_brain.lifecycle import ACTIVE_STATES, BudgetBusy, BudgetExhausted, account_tokens, claim_unit, create_build, recipe_hash, reserve_tokens
 from src.core.project_brain.publisher import branch_fingerprint
 from src.core.project_brain.privacy import PrivacyLedger, PrivacyScanDeferred
@@ -41,6 +42,82 @@ from src.utils.logger import logger
 _EXTRACTION_CACHE: tuple[tuple[str, str, str], FactBundle, int, bool] | None = None
 _CONTEXT_CACHE: tuple[tuple[str, str, str, str], list[dict]] | None = None
 _SOURCE_CACHE: tuple[tuple, SourceCatalog] | None = None
+
+
+def _safe_failure_metadata(exc: Exception) -> dict:
+    metadata = {"exception": type(exc).__name__}
+    for name in ("failure_code", "reason", "phase", "after_response", "reservation_created",
+                 "remaining_seconds", "required_seconds"):
+        if hasattr(exc, name):
+            value = getattr(exc, name)
+            if value is None or type(value) in {str, int, bool}:
+                metadata[name] = value
+    return metadata
+
+
+def _persist_timing(unit: BrainUnit) -> None:
+    diagnostic = unit.diagnostic if isinstance(unit.diagnostic, dict) else {}
+    previous = diagnostic.get("segments", {})
+    current = timing.snapshot()
+    segments = {}
+    for name in timing.SEGMENT_NAMES:
+        old = previous.get(name, {}) if isinstance(previous, dict) else {}
+        old_seconds = old.get("seconds", 0) if isinstance(old, dict) else 0
+        old_count = old.get("count", 0) if isinstance(old, dict) else 0
+        if type(old_seconds) not in {int, float} or type(old_count) is not int:
+            old_seconds, old_count = 0, 0
+        segments[name] = {
+            "seconds": round(float(old_seconds) + current[name]["seconds"], 3),
+            "count": old_count + current[name]["count"],
+        }
+    unit.diagnostic = {**diagnostic, "segments": segments}
+
+
+def _transient_failure_detail(exc: Exception) -> str:
+    if isinstance(exc, ModelTransportFailed):
+        if exc.failure_code == "model_http_retry_exhausted":
+            return f"临时HTTP错误已达到重试次数上限，费用预留保留；failure_code={exc.failure_code}"
+        return f"HTTP错误后剩余工作窗口不足以继续重试，费用预留保留；failure_code={exc.failure_code}"
+    if isinstance(exc, ModelWorkAdmissionDenied):
+        return f"本地模型工作窗口不足，未发送新请求，费用预留保留；failure_code={exc.failure_code}"
+    return f"隐私响应经有界纠正仍未通过完整校验；failure_code={exc.failure_code} reason={exc.reason}"
+
+
+def _record_breaker_event(session, build: BrainBuild, now: datetime) -> None:
+    diagnostic = build.diagnostic if isinstance(build.diagnostic, dict) else {}
+    prior = diagnostic.get("breaker", {})
+    if not isinstance(prior, dict):
+        prior = {}
+    events = []
+    cutoff = now - timedelta(seconds=settings.PROJECT_BRAIN_BREAKER_WINDOW_SECONDS)
+    old_events = prior.get("events")
+    for value in old_events if isinstance(old_events, list) else []:
+        if type(value) is not str:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        if timestamp >= cutoff:
+            events.append(value)
+    trips = prior.get("trips", 0)
+    if type(trips) is not int or trips < 0:
+        trips = 0
+    old_state = prior.get("state")
+    state = old_state if type(old_state) is str and old_state in {"closed", "tripped"} else "closed"
+    tripped_at = prior.get("tripped_at") if type(prior.get("tripped_at")) is str else None
+    now_iso = now.replace(tzinfo=timezone.utc).isoformat()
+    if state == "closed":
+        events.append(now_iso)
+    breaker = {"events": events, "trips": trips, "state": state, "tripped_at": tripped_at}
+    if (state == "closed" and build.execution_state == "running"
+            and len(events) >= settings.PROJECT_BRAIN_BREAKER_THRESHOLD):
+        breaker = {"events": [], "trips": trips + 1, "state": "tripped", "tripped_at": now_iso}
+    build.diagnostic = {**diagnostic, "breaker": breaker}
+    if breaker["state"] == "tripped" and build.execution_state == "running":
+        pause_build(session, build.id)
 
 
 def _source_identity_create(build, *, create: bool) -> bool:
@@ -74,6 +151,41 @@ def _source_catalog(build, project, snapshot, *, create: bool = False) -> Source
         catalog = SourceCatalog(snapshot, raw, key, project.gitlab_project_id, project.branch)
         _SOURCE_CACHE = (signature, catalog)
     return _SOURCE_CACHE[1]
+
+
+_source_catalog_impl = _source_catalog
+
+
+def _timed_source_catalog(*args, **kwargs):
+    if not timing.active():
+        return _source_catalog_impl(*args, **kwargs)
+    with timing.segment("source_catalog"):
+        return _source_catalog_impl(*args, **kwargs)
+
+
+_source_catalog = _timed_source_catalog
+_catalog_bundle_impl = SourceCatalog.bundle
+
+
+def _timed_catalog_bundle(catalog, *args, **kwargs):
+    if not timing.active():
+        return _catalog_bundle_impl(catalog, *args, **kwargs)
+    with timing.segment("bundle"):
+        return _catalog_bundle_impl(catalog, *args, **kwargs)
+
+
+SourceCatalog.bundle = _timed_catalog_bundle
+_extract_impl = FactExtractor.extract
+
+
+def _timed_extract(extractor, *args, **kwargs):
+    if not timing.active():
+        return _extract_impl(extractor, *args, **kwargs)
+    with timing.segment("bundle"):
+        return _extract_impl(extractor, *args, **kwargs)
+
+
+FactExtractor.extract = _timed_extract
 
 
 def _read_source_bundle(store, build, catalog) -> FactBundle:
@@ -732,12 +844,17 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
         if not build.historical and (build.request_seq != project.request_seq or project.maintenance_state != "active"
                                      or project.branch not in settings.main_branch_list or project.source_status == "missing"):
             build.status = "superseded"
+            with timing.segment("checkpoint_commit"):
+                session.flush()
+            _persist_timing(unit)
             _finish_execution_control(session, build)
             session.commit()
             return False
         from src.core.project_brain.recovery import accept_import
-        inherited = "_recovery_import" in result
+        inherited = "_recovery_import" in result or "_incremental_import" in result
         result = accept_import(session, build, unit, result)
+        from src.core.project_brain.incremental import accept_incremental
+        result = accept_incremental(session, build, unit, result)
         if inherited:
             final = session.scalar(select(BrainUnit).where(BrainUnit.build_id == build.id, BrainUnit.kind == "finalize"))
             final.result = {**final.result, "cache_hits": final.result.get("cache_hits", 0) + 1}
@@ -756,7 +873,9 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
                     session.add(BrainUnit(build_id=build.id, key=f"source_privacy:{packet['index']}", kind="source_privacy",
                         input_hash=packet["hash"], payload={"index": packet["index"], "module_id": packet["module_id"], "fact_ids": packet["fact_ids"]}))
                 unit.result = {**result, "cache_hits": 0}
-                session.flush()
+                with timing.segment("checkpoint_commit"):
+                    session.flush()
+                _persist_timing(unit)
                 _finish_execution_control(session, build)
                 session.commit()
                 return True
@@ -791,6 +910,17 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
                 if ledger.seal(sealed["revision"], sealed["content_digest"]) != sealed:
                     raise PrivacySealConflict()
             original_coverage = build.coverage or {}
+            from src.core.project_brain.incremental import verify_incremental_dependencies
+            verify_incremental_dependencies(session, build)
+            imports = (build.diagnostic or {}).get("incremental_imports", {})
+            if build.base_build_id:
+                compiled = session.scalars(select(BrainUnit).where(
+                    BrainUnit.build_id == build.id, BrainUnit.kind == "compile",
+                    BrainUnit.status == "completed")).all()
+                result["coverage"] = {**result["coverage"], "incremental": {
+                    "base_build_id": build.base_build_id,
+                    "reused_compile_units": len(imports),
+                    "compiled_units": len(compiled) - len(imports)}}
             build.artifact_path, build.coverage = result["artifact_path"], {**result["coverage"],
                 **{key: original_coverage[key] for key in ("component_recipes", "recovery_protocol") if key in original_coverage}}
             if original_coverage.get("recovery_protocol"):
@@ -804,7 +934,9 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
                     project.observed_fingerprint = result["fingerprint"]
                 if project.gitlab_sync:
                     session.add(BrainPublication(build_id=build.id, target_branch=project.branch))
-        session.flush()
+        with timing.segment("checkpoint_commit"):
+            session.flush()
+        _persist_timing(unit)
         if unit.kind in {"privacy", "finalize", "source_privacy", "compile"} | SUMMARY_KINDS:
             _advance(session, build, unit.id)
         _finish_execution_control(session, build)
@@ -818,15 +950,20 @@ def execute_brain_unit(self, unit_id: int) -> dict:
     """执行独立阶段，检查点和失败记录均以租约令牌防护。"""
     if not settings.PROJECT_BRAIN_ENABLED:
         return {"status": "disabled"}
+    timing.start()
+    claim_started = utcnow()
     claimed = claim_unit(unit_id)
     if claimed is None:
         return {"status": "skipped"}
     unit, build, project, token = claimed
+    if unit.dispatched_at is not None:
+        timing.record("claim", (claim_started - unit.dispatched_at).total_seconds())
     started = time.monotonic()
     logger.info("知识阶段开始：project_id=%s build_id=%s sha=%s stage=%s", project.gitlab_project_id, build.id, build.source_commit, unit.kind)
     try:
         from src.core.project_brain.recovery import execute_recoverable
-        result = asyncio.run(execute_recoverable(_execute, unit, build, project, token))
+        with timing.segment("execute_total"):
+            result = asyncio.run(execute_recoverable(_execute, unit, build, project, token))
         completed = _complete(unit.id, token, result)
     except (PrivacyScanDeferred, BudgetBusy) as exc:
         # Normal continuation, not a failed attempt. Durable receipts skip all
@@ -841,6 +978,7 @@ def execute_brain_unit(self, unit_id: int) -> dict:
             current.status, current.lease_until, current.lease_token = "pending", None, None
             current.dispatched_at = utcnow() if isinstance(exc, BudgetBusy) else None
             current.attempts = max(0, current.attempts - 1)
+            _persist_timing(current)
             _finish_execution_control(session, failed)
             can_dispatch = failed.status in ACTIVE_STATES and failed.execution_state == "running"
             if not can_dispatch:
@@ -875,6 +1013,9 @@ def execute_brain_unit(self, unit_id: int) -> dict:
                 owner = session.scalar(select(BrainProject).where(BrainProject.id == project.id).with_for_update())
                 affected = session.scalar(select(BrainBuild).where(BrainBuild.id == build.id).with_for_update())
                 if affected.status in ACTIVE_STATES | {"ready"}:
+                    current = session.scalar(select(BrainUnit).where(BrainUnit.id == unit_id).with_for_update())
+                    if current is not None and current.lease_token == token:
+                        _persist_timing(current)
                     affected.status, affected.completed_at = "failed", utcnow()
                     affected.execution_state = "running"
                     affected.error_message = "隐私封存冲突；failure_code=privacy_seal_conflict"
@@ -905,8 +1046,57 @@ def execute_brain_unit(self, unit_id: int) -> dict:
             unresolved = session.scalar(select(BrainModelCall.id).where(
                 BrainModelCall.build_id == build.id, BrainModelCall.unit_id == unit_id,
                 BrainModelCall.lease_token == token, BrainModelCall.state == "unknown").limit(1))
+            unknown_guard = unresolved is not None
+            original = _safe_failure_metadata(exc)
+            diagnostic = current.diagnostic if isinstance(current.diagnostic, dict) else {}
+            current.diagnostic = {
+                **diagnostic,
+                "last_failure": {
+                **original,
+                    "unknown_guard": unknown_guard,
+                    "attempt": current.attempts,
+                    "at": utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                },
+            }
             if unresolved is not None:
                 exc = ModelCallsIncomplete()
+            transient = isinstance(exc, (ModelTransportFailed, PrivacyResponseInvalid, ModelWorkAdmissionDenied))
+            diagnostic = current.diagnostic if isinstance(current.diagnostic, dict) else {}
+            transient_retries = diagnostic.get("transient_retries", 0)
+            if type(transient_retries) is not int or transient_retries < 0:
+                transient_retries = settings.PROJECT_BRAIN_UNIT_TRANSIENT_RETRIES
+            if (transient and not unknown_guard
+                    and transient_retries < settings.PROJECT_BRAIN_UNIT_TRANSIENT_RETRIES
+                    and failed.status in ACTIVE_STATES):
+                retry_number = transient_retries + 1
+                current.diagnostic = {**(current.diagnostic or {}), "transient_retries": retry_number}
+                current.status, current.lease_until, current.lease_token = "pending", None, None
+                current.attempts = max(0, current.attempts - 1)
+                current.dispatched_at = utcnow()
+                detail = _transient_failure_detail(exc)
+                current.error_message = f"{type(exc).__name__}：{detail}"
+                _record_breaker_event(session, failed, utcnow())
+                _finish_execution_control(session, failed)
+                can_dispatch = failed.status in ACTIVE_STATES and failed.execution_state == "running"
+                if not can_dispatch:
+                    current.dispatched_at = None
+                countdown = min(900, settings.PROJECT_BRAIN_TRANSIENT_BACKOFF_SECONDS * 2 ** (retry_number - 1))
+                _persist_timing(current)
+                session.commit()
+                if can_dispatch:
+                    try:
+                        execute_brain_unit.apply_async(args=[unit_id], countdown=countdown,
+                                                       queue="brain", retry=False)
+                    except Exception as broker_error:
+                        with SyncSession() as session:
+                            current = session.scalar(select(BrainUnit).where(
+                                BrainUnit.id == unit_id).with_for_update())
+                            if current.status == "pending" and current.lease_token is None:
+                                current.dispatched_at = None
+                                session.commit()
+                        logger.warning("知识瞬时重试投递失败，等待定期恢复：build_id=%s unit_id=%s error_type=%s",
+                                       build.id, unit_id, type(broker_error).__name__)
+                return {"status": "deferred" if failed.status in ACTIVE_STATES else "failed"}
             terminal = isinstance(exc, (BudgetExhausted, CompilationLimitError, PrivacyIdentityConflict,
                                        PrivacyCheckpointMissing, SourceBindingError, ModelCallsIncomplete, ModelTransportFailed,
                                         ModelWorkAdmissionDenied, PrivacyResponseInvalid)) or current.attempts >= 3
@@ -920,9 +1110,8 @@ def execute_brain_unit(self, unit_id: int) -> dict:
                       else f"知识隐私检查点缺失或损坏，构建已停止；failure_code={PrivacyCheckpointMissing.failure_code}" if isinstance(exc, PrivacyCheckpointMissing)
                       else f"源码来源认证失败；failure_code={SourceBindingError.failure_code}" if isinstance(exc, SourceBindingError)
                       else f"知识构建仍有在途或未知调用，请先核对费用与响应；failure_code={ModelCallsIncomplete.failure_code}" if isinstance(exc, ModelCallsIncomplete)
-                      else f"临时HTTP错误已达到重试次数或时间上限，费用预留保留；failure_code={exc.failure_code}" if isinstance(exc, ModelTransportFailed)
-                      else f"本地模型工作窗口不足，未发送新请求，费用预留保留；failure_code={exc.failure_code}" if isinstance(exc, ModelWorkAdmissionDenied)
-                      else f"隐私响应经有界纠正仍未通过完整校验；failure_code={exc.failure_code} reason={exc.reason}" if isinstance(exc, PrivacyResponseInvalid)
+                      else _transient_failure_detail(exc) if isinstance(
+                          exc, (ModelTransportFailed, ModelWorkAdmissionDenied, PrivacyResponseInvalid))
                       else f"概览输出未满足有界字段或字节预算；failure_code={exc.failure_code}" if isinstance(exc, CompilationLimitError) and exc.failure_code == "summary_output_capacity"
                       else f"知识单元超出完整字段、上下文或输出硬上限，请检查容量配置；failure_code={exc.failure_code}" if isinstance(exc, CompilationLimitError)
                       else PrivacyFilter().sanitize_text(str(exc))[:300] if type(exc) is ValueError
@@ -937,6 +1126,7 @@ def execute_brain_unit(self, unit_id: int) -> dict:
             can_retry = not terminal and failed.execution_state == "running"
             if not can_retry:
                 current.dispatched_at = None
+            _persist_timing(current)
             session.commit()
         logger.warning("知识阶段失败：build_id=%s stage=%s error_type=%s", build.id, unit.kind, type(exc).__name__)
         if isinstance(exc, PrivacyIdentityConflict):
@@ -1043,6 +1233,47 @@ def recover_brain() -> dict:
             build = session.scalar(select(BrainBuild).where(BrainBuild.id == paused_id).with_for_update()
                                    .execution_options(populate_existing=True))
             _finish_execution_control(session, build)
+            session.commit()
+        paused_ids = session.scalars(select(BrainBuild.id).where(
+            BrainBuild.status.in_(ACTIVE_STATES), BrainBuild.execution_state == "paused",
+            BrainBuild.paused_at.is_not(None))).all()
+        from src.core.project_brain.execution import resume_build
+        for paused_id in paused_ids:
+            observed = session.get(BrainBuild, paused_id)
+            diagnostic = observed.diagnostic if isinstance(observed.diagnostic, dict) else {}
+            breaker = diagnostic.get("breaker")
+            if (not isinstance(breaker, dict) or breaker.get("state") != "tripped"
+                    or observed.paused_at > now - timedelta(seconds=settings.PROJECT_BRAIN_BREAKER_COOLDOWN_SECONDS)):
+                continue
+            session.scalar(select(BrainProject).where(
+                BrainProject.id == observed.project_id).with_for_update())
+            build = session.scalar(select(BrainBuild).where(
+                BrainBuild.id == paused_id).with_for_update().execution_options(populate_existing=True))
+            diagnostic = build.diagnostic if isinstance(build.diagnostic, dict) else {}
+            breaker = diagnostic.get("breaker")
+            if (build.status not in ACTIVE_STATES or build.execution_state != "paused"
+                    or not isinstance(breaker, dict) or breaker.get("state") != "tripped"
+                    or build.paused_at is None
+                    or build.paused_at > now - timedelta(seconds=settings.PROJECT_BRAIN_BREAKER_COOLDOWN_SECONDS)):
+                session.commit()
+                continue
+            trips = breaker.get("trips", 0)
+            if type(trips) is not int or trips < 0:
+                trips = settings.PROJECT_BRAIN_BREAKER_MAX_TRIPS + 1
+            if trips > settings.PROJECT_BRAIN_BREAKER_MAX_TRIPS:
+                build.status, build.completed_at, build.execution_state = "failed", now, "running"
+                build.error_message = "上游模型服务持续异常，熔断次数已达上限；failure_code=upstream_unhealthy"
+                _cancel_unfinished(session, build.id)
+                _finish_execution_control(session, build)
+                session.commit()
+                continue
+            try:
+                resume_build(session, build.id)
+            except (ExecutionConflict, ModelCallsIncomplete) as exc:
+                session.rollback()
+                reason = getattr(exc, "reason", ModelCallsIncomplete.failure_code)
+                logger.warning("知识熔断自动恢复暂不可用：build_id=%s reason=%s", paused_id, reason)
+                continue
             session.commit()
         session.commit()
         session.expunge_all()

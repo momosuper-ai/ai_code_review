@@ -17,7 +17,7 @@
 
 在原 AI 代码审查服务中增加 Project Brain，逐步替代旧 AI_README：从固定 Git 提交构造事实、关系和知识卡片，经过隐私、结构、证据及版本校验后生成文档，提供查询/ZIP 下载和可控 GitLab 写回。
 
-- **共用原 GitLab Webhook**：目标分支 push / MR merge 自动触发；产品目标为无有效基准则首建、有兼容基准则增量。当前schema2的普通跨提交编译复用尚未接回（见第4节第13项），不能把同SHA认证恢复当作普通增量已完成。首次接入不要求用户调用 API 或预先手填 Project ID。
+- **共用原 GitLab Webhook**：目标分支 push / MR merge 自动触发；产品目标为无有效基准则首建、有兼容基准则增量。2.4.1加入schema2跨提交compile检查点复用；privacy/source_privacy仍完整重跑，离线实现不等同于生产验收。首次接入不要求用户调用 API 或预先手填 Project ID。
 - 审查和 Brain 共用事件入口，但独立登记、去重、队列和生命周期；审查/评论失败不能阻止知识更新。MR merge 解析目标分支 HEAD，再固定完整 SHA。
 - JSON 是规范知识，Markdown 为受控渲染结果。六类卡片为 Project、Architecture、Module、Interface、Data、Flow。
 - 五种语言提供通用结构；Python/Java 优先适配 FastAPI、SQLAlchemy、Spring、JPA、MyBatis。调用关系明确区分 `resolved/candidate/unresolved`，不按同名符号猜测确定关系。
@@ -55,9 +55,9 @@
 8. **2.1 系列实现显式有界 HTTP 重试和 httpx/httpx2 兼容。** 完整读取并关闭的429/500/502/503/504可重试；真正丢失响应/断连/超时仍按 unknown 保护。完整错误重试成功也不能补结算另一条旧 unknown。
 9. **2.2 系列实现认证检查点恢复，避免每次重新调用所有模型。** 完整审计配方与六阶段内容指纹分开；固定源码、完整输入/结果/证据、父私有 MAC/history/seal/收据及真实成功调用均认证后才复用。旧账和 unknown 留在原构建，汇总/组装重新检查。祖先上限8层，不截断或跳过坏链。
 10. **2.2.1修复中断误分类与私有索引双读竞态。** 有界遍历真实异常链、透传真实任务中断；索引一致锁读，未降低来源或隐私门禁。
-11. **另一个诊断缺口仍未修复。** 当前 `src/tasks/brain_task.py` 在 unknown 保护路径仍以 `ModelCallsIncomplete()` 替换原异常，可能丢失原类别和发送阶段。不能据此确诊模型能力、网关500或具体网络超时；unknown 本身也不证明请求已到网关。
+11. **2026-10-26记录的诊断缺口已由2.4.0代码实现处理。** `src/tasks/brain_task.py` 在 unknown 保护路径仍以 `ModelCallsIncomplete()` 作为终态，但替换前会保存受限异常类别/标量字段及 `unknown_guard`；不记录异常正文、URL、请求头、模型内容或响应。不能据此确诊模型能力、网关500或具体网络超时；unknown 本身也不证明请求已到网关。
 12. **待机确实会中断长任务，但时间重叠不等于唯一直接根因。** WSL 保活不防整机睡眠；线程临时唤醒请求不保证阻止手动待机/合盖/所有 Modern Standby 情形。观察器结束也不等于构建失败。
-13. **2026-10-26代码核查：schema2普通增量尚未接回。** 新建构建默认schema2；`brain_task.py:370-374`设置`reused_files=0/incremental=False`，finalize在721-730建立source_privacy并提前返回，绕过731-743旧base_build编译缓存；633-641后续创建全套pending compile。相同输入整版复用、同SHA认证recovery、跨提交普通增量必须区分。`project-brain-sensitive-source-design.md:131-132`也明确跨构建缓存后续再接回。
+13. **2026-10-26核查的schema2普通增量缺口由2.4.1代码接回。** 仅按完整`input_hash`复用compile检查点，privacy/source_privacy仍重跑；父构建/父结果在完成时复核。与同SHA认证recovery分开；离线代码与测试不代表已部署或生产验收。
 14. **2026-10-26历史时序核查：慢不能全归给模型。** 离线解析r4登记前隔离dump（SHA与第6节备份一致），六目标构建调用Token与build账一致，v203/r3调用数与原报告吻合。v203壁钟3小时7分1秒，已结算调用区间去重union仅45分52秒（24.5%），北京时间12:01:07至14:04:36存在2小时3分28秒无任何账内调用在途的空洞；扣此空洞后的约63分32秒仍是未完成构建的其余壁钟，不是纯运行或全流程基线。r3壁钟3小时24分47秒，union59分12秒（28.9%）；首次compile派发前78分29秒，新模型调用仅69秒；source_privacy首末派发跨度30分20秒且新模型调用0。unknown延长至终态仍分别至少141分8秒/142分22秒无账内调用覆盖。无调用区间可能包含认证、图/文件处理、调度或环境停顿，尚未精确归因。
 15. **2026-10-26性能代码结论与估时限制。** 恢复多处反复全父链/收据认证，source_privacy/compile每单元读取认证整facts、全仓blob及图结构；本机仅2个worker槽，有阶段/汇总轮次屏障。尚无profiler占比，不可宣称空洞均由认证导致；来源绑定会覆盖discovery_check，不能笼统写“一次check固定认证父链两遍”。旧冷构建与r3单次隐私P50为0.46/5.75秒、语义10.91/24.43秒，非受控A/B。当前仍无完整成功耗时；稳定同规模冷首建1.5～3小时只是低置信排期估计，当前多父恢复无可信剩余ETA。完整分析见`docs/project-brain-status-performance-20261026.md`，私有安全统计/只读解析脚本在`secrets/brain-performance-audit-20261026/`。
 16. **2026-10-26 ThinkRail结合调研（仅研究，未接入）。** 官方稳定发布核为v0.2.0；源码固定main `d299f20d2ba014f382ddbcc9b49f2aa63fada132`。其spec-graph是设计意图图与按需读取，不是现成全仓知识生成或语义检索；默认有写工具，mtime/size索引不等于Brain来源/隐私认证。建议保留人工规格与固定SHA实现知识的权威差异，正式验收后优先只读MCP消费已有卡片API；当前无MCP、全文/自然语言或独立关系查询API，统一API key也非读写角色隔离。另核pi-dag真实源码有持久编排/幂等/uncertain恢复，但未默认捆绑ThinkRail、private/0.0.0；其pause停止新准入不等于本模块排空后的安全paused。没有接入提速实证，性能主线仍为分段测时/减少重复认证/普通增量。完整来源、代码映射与最小验证方案见`docs/project-brain-thinkrail-assessment-20261026.md`；未安装、运行外部程序/测试、改当前配方或额外探测模型。
@@ -71,7 +71,7 @@
 - 先前fresh c226a797于15:05:24启动、15:05:56终止：privacy0/165、scan1/1、extract1/1，首单元11741初始及两重试均完整HTTP500；占17,115费用上界，实结/unknown/live均0。指定电源窗口无事件、容器无重启/OOM，旧awake终态正常释放；失败报告`secrets/brain-quality/c226a797-67b6-48b8-83b5-ae6a19bf0e0d/`，不评分。用户“现在修好了，再试一下”是本次新授权来源，不是自动失败重试。
 - 已核2.3.3镜像203文件/2237断网回归通过，真实汇总修复与业务质量仍待完整验证。旧636的127编译/103汇总和所有更早账、submitted journal均保留，不重复POST。20分钟观察经工具保持ACTIVE，本地目标已切唯一3fc8f0f6。
 
-- 迁移链：005 Brain基础 → 006自动维护 → 007模型用量 → 008显式HTTP记账 → 009_brain_recovery → **010_brain_control**。新表/字段只走 Alembic。
+- 候选代码迁移链：005 Brain基础 → 006自动维护 → 007模型用量 → 008显式HTTP记账 → 009_brain_recovery → 010_brain_control → **011_brain_diagnostics**。当前试点库仍以实际检查到的版本为准；本次未部署迁移。新表/字段只走 Alembic。
 - 旧r3/r4的认证父镜像：`sha256:8d6a52dbade2ffcd16fa79fac3e3f3806a01a816a7534be63a3756ea5feebb92`。
 - 试点：GitLab项目480/main，固定提交 `7d89860efe1113bcb1480bac2f1aaa9b1045bd8d`；原配方 `aec96ef005d49cb06882bc873d75c033da460e6e25e81cd54d050e3edc717cca`。
 - Windows仓库为 `D:\MO\code\obc_ai_code_review`；WSL Ubuntu 内为 `/mnt/d/MO/code/obc_ai_code_review`。
@@ -240,13 +240,13 @@
 1. 新会话先读取本文件、AGENTS和r4实际journal/授权/状态，再只读核容器、DB、固定版本、租约与账。服务未运行时，不用旧缓存冒充实时结果；启动或恢复应承接用户明确的执行请求及既有边界。
 2. 本次GitLab出站修复已完成并通过WSL/容器TCP及认证固定提交GET；未来若复发，按实际DNS/route重核单目标，不盲写旧eth3或扩大规则，不重启共享环境/关闭防火墙。
 3. 本次全局观察目标已切实际v231；旧r4失败/未冻结及v230终态事实和所有submitted journal保留。每次实际报告显式保存当前构建报告基线，不拿缓存或旧构建当当前进度。
-4. 补齐安全诊断缺口：在异常被 `ModelCallsIncomplete` 替换前记录固定原异常类别、受限传输/发送阶段、调用UUID与时间；不记录异常正文/URL/请求头/响应。用合成异常验证，并保留unknown费用保护；**此修复尚未实现**。
-   - 同时补安全性能分段：队列、父链/收据认证、facts读验、全仓blob/来源图校验、模型、预算等待、提交。优先量化r3首编译前78分钟及零模型source_privacy至少30分钟的去向；减少重复认证须保留late-discovery/write-intent/隔离与封存门禁。2.3.1已完成重复解析/已命中查找减负及合成计数、微基准验证；真实生产分段profile仍未完成，不能把历史空洞全归认证。
-   - v230发送前窗口保护被当HTTP终态的问题，已在2.3.1完成确定性复现、分类修复和2091断网回归；输入安全让出与paid输出终态分别覆盖，预留/unknown保护保留。完整内容认证解析快验与父查找减负也已离线通过；下一步为适当隔离部署和真实性能/完整产物验收，不能直接扩大时间或无限重试。未知调用替换原异常的另一缺口仍未修。
+4. 2.4.0诊断、固定分段计时及有界瞬时单元重试/构建熔断器已在当前代码实现；unknown-call仍终态，预算、证据、隐私、身份/检查点及封存门禁未放宽。异常诊断只保留安全标量，HTTP耗尽与工作窗口不足使用不同固定文案。
+   - 全单测2274通过、定向集合188通过、隔离PostgreSQL测试10通过、`compileall`通过；4条现有deprecation/configuration warnings。无ruff配置，未运行。仅代表离线代码验证，未部署、未真实运行模型或完成生产分段profile。
+   - 分段覆盖source catalog、bundle、execute、recovery auth、model call、checkpoint与claim；报告脚本只读查询。离线计时不能解释r3/v230历史耗时空洞，也不构成生产性能结论。2.3.1的HTTP窗口分类修复及unknown费用保护保留。
 
 ### P1：经授权完成恢复与正式质量验收
 
-当前工程进度：3fc8f0f6真实失败，152/165隐私单元与全部旧账保留。10-30继续请求下已建立命中原868行的合成红测（2 failed）；先实现严格引用校验下的有界纠错及固定异常分类，并验证实时投影、独立计费、预算/租约/中断和收据拒绝边界。未部署新版本、未新建、未追加模型调用。离线通过后再核新的完整配方与认证兼容及剩余额度；不能注入旧付费检查点。只有真正ready才执行对应正式门禁与冻结50题。
+最近一次实际运行状态记录（10-30 09:51）为3fc8f0f6失败，152/165隐私单元与全部旧账保留；本次只做离线代码工作，未重新读取DB，不能据此声称运行状态更新。2.4.1包含2.4.0诊断、计时、瞬时重试和熔断器，以及schema2跨提交compile复用；privacy/source_privacy仍完整重跑。本次修复为旧ready增量构建保留兼容读取，并把新构建生成器版本记入diagnostic；`brain_version`仍只是整数构建序号。定向376项、全量单测2293项、`compileall`通过；PostgreSQL集成未在本次重跑。未部署、未调用真实模型或观察CI；离线通过不代表生产配方兼容或正式质量验收。生产环境验证和冻结50题只在真正ready后进行。
 
 5. 当前唯一跟进2.3.2认证恢复子636bd04e，父59e11245；新控制brain-v232r1-validation-20261028，request-attempt submitted不可重发。用户10-28网关调整后继续的授权已执行，一父实际同配方/私有认证frozen，旧59没有已完成compile所以导入0；八旧账保留、新cap7,802,111，总仍16M。同两模型/完整隐私/写回关闭，14:51实查privacy165/165、source_privacy127/127、compile127/127，module_summary103/104，failed/capacity_limit、运行0。用户明确暂停/继续时控制该子UUID；失败只诊断保留检查点，不自动再建/探测/加额。
 6. 实际恢复时继续保留固定SHA、完整隐私、暂停/写回关闭和所有旧账；更新临时防待机与WSL保活的真实身份/状态。不能承诺阻止主动睡眠；失败即停下诊断，不靠无限重试或加额凑完成。
@@ -255,8 +255,8 @@
 
 ### P2：完整产品验收与后续能力
 
-9. 验收普通增量、删除/重命名、公共依赖变化、force push/目标删除、并发与Broker/Worker恢复；单次认证恢复不代表普通增量已通过。
-   - 在验收前先接回schema2普通跨提交复用：当前实际绕过旧编译缓存，不能承诺日常小改动分钟级完成。须认证当前隐私、来源、内容和依赖兼容，再重建受影响汇总；不能直接复用旧公开投影作为规范图。
+9. 验收2.4.1普通增量的删除/重命名、公共依赖变化、force push/目标删除、并发与Broker/Worker恢复；单次认证恢复不代表普通增量生产路径已验收。
+   - 离线实现按完整输入摘要认证compile复用，当前privacy/source_privacy仍全量重跑；须在授权环境验证父链、隐私投影、受影响汇总和真实耗时，不能据此承诺日常小改动分钟级完成。
 10. 单独授权真实GitLab发布测试：未保护分支提交、受保护分支MR/自动合并条件、审批/CI、并发人工编辑、响应丢失对账、机器人防递归、越界拒绝。当前测试一直关闭写回，不能宣称已经真实发布成功。
 11. 管理员安装并验证服务端目录hook。GitLab Token scope没有目录权限；应用白名单与服务端强制边界不同，脚本交付不等于安装完成。
 12. 同步部署文档中的迁移、配置、预算和历史验证标记；选择稳定交付版本，检查未提交工作树并整理提交。质量优先，之后再据真实分模型/阶段用量优化成本。
@@ -385,3 +385,8 @@
 
 
 **2026-10-30 10:04离线修复通过：** 最终2.3.4候选sha256:022eafeb1518b9f3dbdcf7b272adc9fb651771ef960d04b0243a91c303d5772c，204源码/测试/脚本文件hash锁定，Linux断网2260/2260、0skip；Windows定向163通过。真实模型0，未部署、未新建、未质量评分。证明有界纠错/严格引用/独立计费/终态分类，不能证明原模型究竟返回空值还是其他错误值，不能保证真实纠错成功。文档docs/project-brain-privacy-response-repair.md。承接用户10-30“继续”和此前直接全新构建的偏好，准备唯一一次2.3.4/full固定SHA验证，保留十一旧账13,510,894，剩余cap6,489,106，总上限仍20M、不加额；内容组件变更不注入旧paid单元，不开发跨版本兼容，旧检查点/全部journal/unknown原样保留。新控制brain-v234-validation-20261030尚未登记或启动，下一步私有历史与账实核、隔离备份和API-only部署，门禁固定后再一次登记。
+- **2026-10-30｜2.4.0诊断与瞬时重试（代码已实现/离线通过，未部署/未真实运行）**：新增安全失败诊断、固定分段计时与只读报告、有限瞬时单元重试及构建级熔断/冷却恢复；保留unknown-call、隐私、证据、预算和身份门禁。定向测试188通过、全量单测2274通过、隔离PostgreSQL集成10通过、`compileall`通过；4条既有pytest deprecation/configuration warnings；项目未配置ruff。未调用真实模型、未部署或验证生产性能；schema2普通跨提交增量及真实性能验收仍待推进。
+- **2026-10-30｜2.4.1 schema2跨提交增量（代码已实现/离线通过，未部署/未真实运行）**：加入按完整输入摘要认证的compile复用、父结果完成时复核、覆盖/用量及熔断终态修复；定向319通过、全量单测2287通过、PostgreSQL 16隔离集成10通过、`compileall`通过。privacy/source_privacy stages 仍在每个构建中完整重跑，任何隐私/证据/预算/未知调用门禁均未放宽；4条既有datetime deprecation警告及pytest-asyncio配置deprecation提示。未运行真实模型或部署。
+- **2026-10-30｜2.4.1兼容性与缓存命中修复（代码已实现/离线通过，未部署/未真实运行）**：新构建在`diagnostic`中记录可解析的`generator_version`（`brain_version`是整数构建序号）；旧ready构建无imports和summary时仍可读取；有imports、coverage中有incremental键、生成器版本达到2.4.1或记录的版本不可解析时要求有效summary。incremental imports也会增加finalize `cache_hits`。定向376通过、全量单测2293通过、`compileall`通过；PostgreSQL集成未重跑。4条既有datetime deprecation警告及pytest-asyncio配置deprecation提示。未部署、未调用真实模型或观察CI；privacy/source_privacy仍完整重跑，隐私/证据/预算/unknown-call门禁未放宽。
+- **2026-10-30｜2.4.1已部署WSL隔离栈并登记新8M冷构建（真实构建已运行，未ready/未质量验收）**：PR #1 CI通过（test 3.12）。WSL独立worktree构建镜像sha256:4723f8ef…811c，镜像内断网单测2293通过；旧镜像标记`obc-brain-local:2.3.4-backup`，隔离库备份与`.env.brain-local`备份在`secrets/brain-v241-validation-20261030/`。迁移至`011_brain_diagnostics`，`PROJECT_BRAIN_MAX_BUILD_TOKENS=8000000`（用户新授权8M，旧轮账全部保留未清算），写回关闭。真实模型协议探测`test_brain_real_model.py` 1通过。11:5x(北京)唯一O_EXCL登记新构建`4b4cc802-be20-41e4-8623-325be53b38f6`（项目480/main，固定SHA 7d89860e，historical，recipe 6f67eed6…），登记后1分钟实际读DB：scan/extract完成、privacy 24/165、2运行。冻结50题题库已在WSL找到（`secrets/brain-v2*-validation-*/questions_source.json`，sha256 45f6…72cd9，源SHA同7d89860e，7类共50题），ready后用其评分。Windows临时防待机：`keep_awake.ps1`（≤14h，`keep-awake.stop`停止，不改电源计划）。
+- **2026-10-30｜4b4cc802 新8M冷构建失败（真实运行、环境中断，非代码失败；未ready/未质量验收）**：14:11～14:13（北京时间）实际读库：privacy 165/165、source_privacy 127/127、compile 19/127（复用0，冷建无父，符合预期），finalize完成；已结算957,378，总占993,472（含1条unknown调用`f03ed953-e9e9-4944-b068-7cbbe67efc66`的预留，04:31:05Z登记），live0。Windows事件：12:30:58（北京时间）506“Idle Timeout”进入Modern Standby，最后一次调用04:31:10Z（12:31:10）；12:50:22异常重启（41/6008）；13:50:38再次空闲待机、14:03:55开盖恢复；WSL 14:09:08启动，容器退出255/OOMfalse。恢复服务栈后Beat回收过期租约，按unknown保护终态`model_calls_incomplete`（unit 12386，未经新last_failure路径故无该诊断），瞬时重试0次。结论：防待机助手只请求ES_SYSTEM_REQUIRED，挡不住Modern Standby空闲超时；改为ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED（不改电源计划，旧脚本备份keep_awake.ps1.v1）。用户“现在重新连上并继续吧”后，下一步：只读核恢复计划，以4b4cc802为父唯一POST同SHA认证恢复，子构建上限=8,000,000−993,472=7,006,528，旧账/unknown全部保留，写回关闭。

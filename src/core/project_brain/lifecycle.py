@@ -135,6 +135,7 @@ def create_build(session: Session, project_id: int, branch: str, name: str, sha:
     build = BrainBuild(project_id=project.id, source_commit=sha, recipe_hash=recipe, mode=mode,
                        generation=generation,
                        coverage={"public_schema_version": "2.0", "component_recipes": component_recipes()},
+                       diagnostic={"generator_version": GENERATOR_VERSION},
                        request_seq=project.request_seq, brain_version=project.next_version, historical=historical,
                        base_build_id=previous.id if previous else None)
     project.next_version += 1

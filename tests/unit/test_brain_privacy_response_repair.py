@@ -185,7 +185,7 @@ def test_error_metadata_and_api_are_closed():
             PrivacyResponseInvalid(reason)
 
 
-def test_exhausted_scan_stops_worker_once_and_preserves_each_call_bill(scan, database, monkeypatch):
+def test_exhausted_scan_defers_once_and_preserves_each_call_bill(scan, database, monkeypatch):
     from sqlalchemy import select
     from unittest.mock import MagicMock
     from src.core.project_brain.usage import BuildCallMeter
@@ -199,6 +199,8 @@ def test_exhausted_scan_stops_worker_once_and_preserves_each_call_bill(scan, dat
     monkeypatch.setattr(brain_task.execute_brain_unit, 'retry', retry)
     dispatch = MagicMock()
     monkeypatch.setattr(brain_task, 'dispatch_pending', dispatch)
+    transient_dispatch = MagicMock()
+    monkeypatch.setattr(brain_task.execute_brain_unit, 'apply_async', transient_dispatch)
     scan.local.chat.return_value = response([{'value': 'AbsentSyntheticValue', 'type': 'SECRET'}])
 
     async def execute(unit, build, project, token):
@@ -206,16 +208,19 @@ def test_exhausted_scan_stops_worker_once_and_preserves_each_call_bill(scan, dat
         await scan.guard._scan(scan.records, scan.scope, 0)
 
     monkeypatch.setattr(brain_task, '_execute', execute)
-    assert brain_task.execute_brain_unit.run(trial.units[0]) == {'status': 'failed'}
+    assert brain_task.execute_brain_unit.run(trial.units[0]) == {'status': 'deferred'}
     retry.assert_not_called()
     dispatch.assert_not_called()
+    transient_dispatch.assert_called_once_with(
+        args=[trial.units[0]], countdown=60, queue='brain', retry=False)
     with database() as session:
         build = session.get(BrainBuild, trial.build_id)
         unit = session.get(BrainUnit, trial.units[0])
         calls = list(session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == build.id)))
-        assert build.status == unit.status == 'failed' and unit.attempts == 1
-        assert 'failure_code=privacy_response_invalid' in build.error_message
-        assert 'value_not_in_input' in build.error_message and 'AbsentSyntheticValue' not in build.error_message
+        assert build.status != 'failed' and unit.status == 'pending' and unit.attempts == 0
+        assert unit.diagnostic['transient_retries'] == 1
+        assert 'failure_code=privacy_response_invalid' in unit.error_message
+        assert 'value_not_in_input' in unit.error_message and 'AbsentSyntheticValue' not in unit.error_message
         assert len(calls) == len({c.id for c in calls}) == 3
         assert sorted(c.attempt for c in calls) == [1, 2, 3]
         assert all(c.state == 'settled' for c in calls)

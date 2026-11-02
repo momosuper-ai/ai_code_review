@@ -711,6 +711,9 @@ def test_migration_upgrade_and_downgrade_match_models():
     control_spec = importlib.util.spec_from_file_location("brain_control_migration", Path(__file__).parents[2] / "alembic/versions/010_brain_execution_control.py")
     control_module = importlib.util.module_from_spec(control_spec)
     control_spec.loader.exec_module(control_module)
+    diagnostic_spec = importlib.util.spec_from_file_location("brain_diagnostic_migration", Path(__file__).parents[2] / "alembic/versions/011_brain_diagnostics.py")
+    diagnostic_module = importlib.util.module_from_spec(diagnostic_spec)
+    diagnostic_spec.loader.exec_module(diagnostic_module)
     engine = create_engine("sqlite://")
     with engine.begin() as connection:
         operations = Operations(MigrationContext.configure(connection))
@@ -731,6 +734,7 @@ def test_migration_upgrade_and_downgrade_match_models():
             http_module.upgrade()
             recovery_module.upgrade()
             control_module.upgrade()
+            diagnostic_module.upgrade()
             from sqlalchemy import text
 
             assert connection.execute(text("SELECT maintenance_state FROM brain_projects ORDER BY id")).scalars().all() == ["active", "paused", "unmanaged"]
@@ -739,6 +743,7 @@ def test_migration_upgrade_and_downgrade_match_models():
             schema = inspect(connection)
             for model in (BrainProject, BrainBuild, BrainUnit, BrainPublication, BrainModelCall, BrainRecovery):
                 assert {c["name"] for c in schema.get_columns(model.__tablename__)} == set(model.__table__.columns.keys())
+            diagnostic_module.downgrade()
             control_module.downgrade()
             recovery_module.downgrade()
             http_module.downgrade()

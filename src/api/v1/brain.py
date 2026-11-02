@@ -83,12 +83,21 @@ async def _build(session: AsyncSession, project_id: int, build_id: str) -> Brain
     build = await session.scalar(select(BrainBuild).join(BrainProject).where(BrainBuild.id == build_id, BrainProject.gitlab_project_id == project_id))
     if not build:
         raise HTTPException(404, "知识构建不存在")
-    if build.status == "ready" and (build.coverage or {}).get("recovery_protocol"):
+    diagnostic = build.diagnostic if isinstance(build.diagnostic, dict) else {}
+    if build.status == "ready" and (
+            (build.coverage or {}).get("recovery_protocol") or build.base_build_id
+            or isinstance(build.diagnostic, dict) and "incremental_imports" in diagnostic):
         from src.core.project_brain.recovery import verify_dependencies, RecoveryRejected
         try:
-            await session.run_sync(lambda sync: verify_dependencies(sync, build))
+            if (build.coverage or {}).get("recovery_protocol"):
+                await session.run_sync(lambda sync: verify_dependencies(sync, build))
+            if build.base_build_id or isinstance(build.diagnostic, dict) and "incremental_imports" in diagnostic:
+                from src.core.project_brain.incremental import verify_incremental_dependencies
+                await session.run_sync(lambda sync: verify_incremental_dependencies(sync, build))
         except RecoveryRejected:
             raise HTTPException(409, "恢复依赖已经改变，知识版本需要重新验证") from None
+        except ValueError:
+            raise HTTPException(409, "增量复用依赖已经改变，知识版本需要重新验证") from None
     return build
 
 
@@ -207,7 +216,10 @@ async def get_brain(project_id: int, branch: str = Query(...), session: AsyncSes
     """查看当前版本、覆盖、新鲜度和独立发布状态。"""
     project = await _project(session, project_id, branch)
     build = await session.get(BrainBuild, project.active_build_id) if project.active_build_id else None
-    if build and build.status == "ready" and (build.coverage or {}).get("recovery_protocol"):
+    if build and build.status == "ready" and (
+            (build.coverage or {}).get("recovery_protocol")
+            or build.base_build_id
+            or isinstance(build.diagnostic, dict) and "incremental_imports" in build.diagnostic):
         build = await _build(session, project_id, build.id)
     publication = await session.scalar(select(BrainPublication).where(BrainPublication.build_id == build.id)) if build else None
     public = build is None or _public_protocol(build)
@@ -302,6 +314,8 @@ async def get_model_usage(project_id: int, build_id: str, session: AsyncSession 
     if (build.coverage or {}).get("recovery_protocol"):
         from src.core.project_brain.recovery import usage_lineage
         data["recovery"] = await session.run_sync(lambda sync: usage_lineage(sync, build))
+    if (build.coverage or {}).get("incremental"):
+        data["incremental"] = build.coverage["incremental"]
     if _public_protocol(build):
         # Configured model aliases are free text and can collide with a source
         # secret. Machine labels preserve the numeric attribution, not aliases.

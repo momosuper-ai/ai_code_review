@@ -490,17 +490,26 @@ async def execute_recoverable(original, unit, build, project, token):
 
 
 async def _execute_recovery(original, unit, build, project, token):
+    from src.core.project_brain import timing
     from src.core.project_brain.lifecycle import SyncSession
     from src.core.project_brain.artifacts import ArtifactStore
-    if (build.coverage or {}).get("recovery_protocol") != PROTOCOL:
+    async def incremental_or_original():
+        if unit.kind == "compile" and build.base_build_id:
+            from src.core.project_brain.incremental import incremental_compile_checkpoint
+            result = await incremental_compile_checkpoint(unit, build, project, token, ArtifactStore())
+            if result is not None:
+                return result
         return await original(unit, build, project, token)
+
+    if (build.coverage or {}).get("recovery_protocol") != PROTOCOL:
+        return await incremental_or_original()
     if build.recipe_hash != recipe_hash():
         _fail()
     store = ArtifactStore()
     with SyncSession() as session:
         recovery = session.get(BrainRecovery, build.id)
     if recovery is None:
-        return await original(unit, build, project, token)
+        return await incremental_or_original()
     if unit.kind == "scan":
         result = await original(unit, build, project, token)
         with SyncSession() as session:
@@ -508,11 +517,17 @@ async def _execute_recovery(original, unit, build, project, token):
             session.commit()
         return result
     with SyncSession() as session:
-        loaded = load_recovery(session, build, project, store)
+        with timing.segment("recovery_auth"):
+            loaded = load_recovery(session, build, project, store)
     if unit.kind == "compile":
         inherited = await _compile_checkpoint(unit, build, project, token, store, loaded)
         if inherited is not None:
             return inherited
+        if build.base_build_id:
+            from src.core.project_brain.incremental import incremental_compile_checkpoint
+            inherited = await incremental_compile_checkpoint(unit, build, project, token, store)
+            if inherited is not None:
+                return inherited
     return await original(unit, build, project, token)
 
 
