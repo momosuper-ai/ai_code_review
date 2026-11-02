@@ -12,7 +12,7 @@ from src.core.project_brain.exceptions import ModelTransportFailed, PrivacyRespo
 from src.core.project_brain.execution import pause_build, resume_build
 from src.core.project_brain.incremental import IncrementalRejected, accept_incremental
 from src.core.project_brain.lifecycle import BudgetExhausted, create_build
-from src.core.project_brain.transport import PreparedCall, run_model_call
+from src.core.project_brain.transport import ModelCallTimedOut, PreparedCall, run_model_call
 from src.core.project_brain.usage import BuildCallMeter, CallSpec
 from src.core.project_brain.trusted_packet import checkpoint_digest
 from src.models.brain import BrainBuild, BrainModelCall, BrainProject, BrainUnit, utcnow
@@ -360,8 +360,63 @@ def test_known_unsent_projection_failure_uses_existing_unit_retry(database, monk
             BrainModelCall.build_id == build_id, BrainModelCall.unit_id == unit_id))
         unit, build = session.get(BrainUnit, unit_id), session.get(BrainBuild, build_id)
         assert call.state == "unsent" and not sdk_calls
-        assert unit.status == "pending" and unit.diagnostic["transient_retries"] == 1
+        assert unit.status == "pending" and unit.attempts == 0
+        assert unit.diagnostic["transient_retries"] == 1
         assert unit.diagnostic["last_failure"]["unknown_guard"] is False
+        assert build.status in {"pending", "scanning"}
+
+
+def test_post_send_timeout_is_known_charge_and_uses_existing_unit_retry(database, monkeypatch):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_ENABLED", True)
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 3)
+    build_id, (unit_id,) = _build(database, commit="t" * 40)
+    sent = []
+
+    async def fail_after_send(unit, build, project, token):
+        meter = BuildCallMeter(build.id, unit.id, token)
+
+        class Guard:
+            call_meter = meter
+            ledger = None
+            calls = 0
+
+            def check_discoveries(self):
+                return None
+
+            def remaining_seconds(self):
+                return 480
+
+            async def reserve_model_call(self, bound, spec, *, after_response, minimum_seconds):
+                call_id = str(uuid4())
+                self.call_meter.reserve(call_id, bound, spec)
+                return call_id
+
+        async def send():
+            sent.append(True)
+            await asyncio.sleep(0.05)
+
+        await run_model_call(Guard(), CallSpec("privacy", "local_model", "generic"),
+                             lambda: PreparedCall(100, send), timeout=0.001, after_response=False,
+                             privacy=True)
+
+    monkeypatch.setattr(brain_task, "_execute", fail_after_send)
+    dispatch = MagicMock()
+    monkeypatch.setattr(brain_task.execute_brain_unit, "apply_async", dispatch)
+    assert brain_task.execute_brain_unit.run(unit_id) == {"status": "deferred"}
+    dispatch.assert_called_once_with(args=[unit_id], countdown=60, queue="brain", retry=False)
+
+    with database() as session:
+        call = session.scalar(select(BrainModelCall).where(
+            BrainModelCall.build_id == build_id, BrainModelCall.unit_id == unit_id))
+        unit, build = session.get(BrainUnit, unit_id), session.get(BrainBuild, build_id)
+        assert sent == [True]
+        assert call.state == "timed_out" and call.closed_at is not None
+        assert unit.status == "pending" and unit.attempts == 0
+        assert unit.diagnostic["transient_retries"] == 1
+        assert unit.diagnostic["last_failure"]["unknown_guard"] is False
+        assert "failure_code=model_call_timeout" in unit.error_message
+        assert unit.payload["_reserved_tokens"] == unit.payload.get("_unknown_tokens", 0) == 0
+        assert build.reserved_tokens == 100
         assert build.status in {"pending", "scanning"}
 
 

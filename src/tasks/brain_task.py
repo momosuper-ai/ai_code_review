@@ -77,6 +77,8 @@ def _transient_failure_detail(exc: Exception) -> str:
     if isinstance(exc, LateProjectionExceedsReservation):
         return f"发送前安全投影超出已预留请求额度，预留已释放；failure_code={exc.failure_code}"
     if isinstance(exc, ModelTransportFailed):
+        if exc.failure_code == "model_call_timeout":
+            return f"模型请求等待超时，按预留上限计费；failure_code={exc.failure_code}"
         if exc.failure_code == "model_http_retry_exhausted":
             return f"临时HTTP错误已达到重试次数上限，费用预留保留；failure_code={exc.failure_code}"
         return f"HTTP错误后剩余工作窗口不足以继续重试，费用预留保留；failure_code={exc.failure_code}"
@@ -418,13 +420,16 @@ def _model_usage_snapshot(session, build_id: str, assembler_id: int) -> dict:
     build = session.get(BrainBuild, build_id)
     calls = session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == build_id)).all()
     closed = [call for call in calls if call.state == "http_error"]
+    timed_out = [call for call in calls if call.state == "timed_out"]
     data = {"model_calls_settled": sum(call.state == "settled" for call in calls),
             "model_calls_unsent": sum(call.state == "unsent" for call in calls),
             "model_calls_closed_http_errors": len(closed),
+            "model_calls_timed_out": len(timed_out),
             "model_usage_unknown_bound_tokens": sum(call.reserved_tokens for call in closed),
+            "model_usage_timed_out_reserved_tokens": sum(call.reserved_tokens for call in timed_out),
             "model_usage_settled_tokens": build.total_prompt_tokens + build.total_completion_tokens,
             "model_usage_budget_occupied_tokens": build.reserved_tokens,
-            "model_usage_financially_exact": not closed and not build.usage_estimated}
+            "model_usage_financially_exact": not closed and not timed_out and not build.usage_estimated}
     from src.core.project_brain.recovery import recovery_coverage
     data.update(recovery_coverage(session, build_id))
     return data

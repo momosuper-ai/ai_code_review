@@ -328,6 +328,43 @@ def close_unsent_call(build_id: str, unit_id: int, lease_token: str, call_id: st
         session.commit()
 
 
+def close_timed_out_call(build_id: str, unit_id: int, lease_token: str, call_id: str, bound: int) -> bool:
+    """Close a client-side wait_for timeout while retaining its full charge."""
+    validate_call_id(call_id)
+    if type(bound) is not int or bound <= 0:
+        raise ValueError("知识超时调用额度无效")
+    with SyncSession() as session:
+        build = session.scalar(select(BrainBuild).where(BrainBuild.id == build_id).with_for_update())
+        unit = session.scalar(select(BrainUnit).where(BrainUnit.id == unit_id).with_for_update())
+        call = session.scalar(select(BrainModelCall).where(BrainModelCall.id == call_id).with_for_update())
+        if (build is None or unit is None or call is None or unit.build_id != build_id
+                or call.build_id != build_id or call.unit_id != unit_id or call.lease_token != lease_token
+                or unit.lease_token != lease_token or unit.status != "running" or build.status not in ACTIVE_STATES
+                or build.execution_state not in {"running", "pausing"}
+                or unit.lease_until is None or unit.lease_until <= utcnow()
+                or call.state != "reserved" or call.reserved_tokens != bound
+                or call.transport_group is None or call.transport_attempt is None
+                or call.http_status is not None or call.closed_at is not None or call.settled_at is not None
+                or call.response_model is not None or call.usage_estimated
+                or any(type(value) is not int or value != 0 for value in
+                       (call.prompt_tokens, call.completion_tokens, call.cached_tokens))):
+            raise ValueError("知识超时调用归属或状态无效")
+        CallSpec(call.role, call.requested_model, call.purpose, call.attempt,
+                 call.transport_group, call.transport_attempt).validate()
+        count = session.scalar(select(func.count()).select_from(BrainModelCall).where(
+            BrainModelCall.build_id == build_id, BrainModelCall.state == "timed_out"))
+        if count >= settings.PROJECT_BRAIN_MAX_TIMED_OUT_CALLS:
+            return False
+        payload = unit.payload or {}
+        live = payload.get("_reserved_tokens", 0)
+        if type(live) is not int or live < bound or build.reserved_tokens < bound:
+            raise ValueError("知识超时调用预留额度无效")
+        call.state, call.closed_at = "timed_out", utcnow()
+        unit.payload = {**payload, "_reserved_tokens": live - bound}
+        session.commit()
+        return True
+
+
 def account_tokens(build_id: str, usage: TokenUsage, estimated: bool, bound: int, unit_id: int | None = None,
                    lease_token: str | None = None, *, call_id: str | None = None, response_model: str | None = None) -> None:
     """记录实际/估算 Token，供应商异常超出预留预算时阻止发布。"""

@@ -11,7 +11,7 @@ from src.core.llm_client import TokenUsage
 from src.core.project_brain.exceptions import ModelCallsIncomplete
 from src.core.project_brain.compiler import LateProjectionExceedsReservation
 from src.core.project_brain.lifecycle import BudgetExhausted, claim_unit, create_build
-from src.core.project_brain.transport import PreparedCall, run_model_call
+from src.core.project_brain.transport import ModelCallTimedOut, PreparedCall, run_model_call
 from src.core.project_brain.usage import (
     HTTP_ERROR_UNIT_LIMIT, BuildCallMeter, CallSpec, abandon_reservation,
     assert_calls_terminal, usage_data,
@@ -89,6 +89,180 @@ def test_known_unsent_releases_reservation_and_is_terminal(database):
     for row in [*data["models"], *data["breakdown"]]:
         assert row["unsent_calls"] == 1
         assert row["total_tokens"] == row["unknown_reserved_tokens"] == 0
+
+
+def test_timed_out_retains_bound_and_reports_known_charge(database):
+    unit, build, _, meter = claimed(database)
+    call_id = reserve_http(meter, str(uuid4()), bound=100)
+    assert meter.close_timed_out(call_id, 100) is True
+
+    with database() as session:
+        call = session.get(BrainModelCall, call_id)
+        current = session.get(BrainBuild, build.id)
+        current_unit = session.get(BrainUnit, unit.id)
+        assert call.state == "timed_out" and call.closed_at is not None
+        assert call.http_status is None and call.settled_at is None
+        assert (call.prompt_tokens, call.completion_tokens, call.cached_tokens) == (0, 0, 0)
+        assert call.usage_estimated is False
+        assert current.reserved_tokens == 100
+        assert current_unit.payload["_reserved_tokens"] == current_unit.payload.get("_unknown_tokens", 0) == 0
+        assert_calls_terminal(session, build.id)
+
+    data = snapshot_usage(database, build.id)
+    assert data["timed_out_calls"] == 1 and data["timed_out_reserved_tokens"] == 100
+    assert data["unknown_reserved_tokens"] == data["ambiguous_reserved_tokens"] == 0
+    assert not data["exact_model_shares_available"]
+    for row in [*data["models"], *data["breakdown"]]:
+        assert row["timed_out_calls"] == 1
+        assert row["timed_out_reserved_tokens"] == 100
+        assert row["unknown_reserved_tokens"] == 0
+
+
+def test_timed_out_transport_group_and_settled_retry_satisfy_budget_equation(database):
+    _, build, _, meter = claimed(database)
+    group = str(uuid4())
+    first = reserve_http(meter, group, bound=100)
+    assert meter.close_http_error(first, 100, 500) == 1
+    timed_out = reserve_http(meter, group, 2, bound=120)
+    assert meter.close_timed_out(timed_out, 120) is True
+    settled = str(uuid4())
+    meter.reserve(settled, 10, CallSpec("semantic", "deepseek-v4-flash", "initial"))
+    meter.settle(settled, TokenUsage(8, 2), False, 10, None)
+
+    with database() as session:
+        current = session.get(BrainBuild, build.id)
+        assert current.reserved_tokens == 230
+        assert_calls_terminal(session, build.id)
+    data = snapshot_usage(database, build.id)
+    assert data["closed_http_error_reserved_tokens"] == 100
+    assert data["timed_out_reserved_tokens"] == 120
+    assert data["total_tokens"] == 10
+    assert data["unattributed_reserved_tokens"] == 0
+
+
+@pytest.mark.parametrize("fault", ["usage", "http_status", "closed_at"])
+def test_malformed_timed_out_call_is_not_terminal(database, fault):
+    _, build, _, meter = claimed(database)
+    call_id = reserve_http(meter, str(uuid4()), bound=100)
+    with database() as session:
+        call = session.get(BrainModelCall, call_id)
+        call.state = "timed_out"
+        if fault == "usage":
+            call.prompt_tokens = 1
+        elif fault == "http_status":
+            call.http_status = 500
+        else:
+            call.closed_at = None
+        session.commit()
+    with database() as session:
+        with pytest.raises(ModelCallsIncomplete):
+            assert_calls_terminal(session, build.id)
+
+
+def test_timed_out_limit_refuses_fourth_call_without_mutation(database, monkeypatch):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 3)
+    _, build, _, meter = claimed(database)
+    for _ in range(3):
+        call_id = reserve_http(meter, str(uuid4()), bound=100)
+        assert meter.close_timed_out(call_id, 100) is True
+    with database() as session:
+        assert_calls_terminal(session, build.id)
+    fourth = reserve_http(meter, str(uuid4()), bound=100)
+    with database() as session:
+        before = session.get(BrainBuild, build.id).reserved_tokens
+        before_unit = session.get(BrainUnit, meter.unit_id).payload["_reserved_tokens"]
+    assert meter.close_timed_out(fourth, 100) is False
+    with database() as session:
+        assert session.get(BrainModelCall, fourth).state == "reserved"
+        assert session.get(BrainBuild, build.id).reserved_tokens == before
+        assert session.get(BrainUnit, meter.unit_id).payload["_reserved_tokens"] == before_unit
+
+
+def test_terminal_validation_rejects_build_over_timeout_limit(database, monkeypatch):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 4)
+    _, build, _, meter = claimed(database)
+    for _ in range(4):
+        call_id = reserve_http(meter, str(uuid4()), bound=100)
+        assert meter.close_timed_out(call_id, 100) is True
+    with database() as session:
+        assert_calls_terminal(session, build.id)
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 3)
+    with database() as session:
+        with pytest.raises(ModelCallsIncomplete):
+            assert_calls_terminal(session, build.id)
+
+
+@pytest.mark.parametrize("state", ["foreign_lease", "not_reserved"])
+def test_timed_out_closure_refuses_invalid_ownership_or_state(database, state):
+    unit, build, _, meter = claimed(database)
+    call_id = reserve_http(meter, str(uuid4()), bound=100)
+    closer = meter
+    if state == "foreign_lease":
+        from src.core.project_brain.usage import BuildCallMeter
+        closer = BuildCallMeter(build.id, unit.id, str(uuid4()))
+    else:
+        meter.close_unsent(call_id, 100)
+    with pytest.raises(ValueError):
+        closer.close_timed_out(call_id, 100)
+    with database() as session:
+        call = session.get(BrainModelCall, call_id)
+        assert call.state == ("reserved" if state == "foreign_lease" else "unsent")
+        if state == "foreign_lease":
+            assert session.get(BrainBuild, build.id).reserved_tokens == 100
+            assert session.get(BrainUnit, unit.id).payload["_reserved_tokens"] == 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit,existing", [(3, 3), (0, 0)])
+async def test_run_model_call_timeout_at_limit_keeps_original_timeout(database, monkeypatch, limit, existing):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", limit)
+    _, build, _, meter = claimed(database)
+    for _ in range(existing):
+        call_id = reserve_http(meter, str(uuid4()), bound=100)
+        assert meter.close_timed_out(call_id, 100) is True
+    sent = []
+    reserved = []
+
+    class Guard:
+        call_meter = meter
+        ledger = None
+        calls = 0
+
+        def check_discoveries(self):
+            return None
+
+        def remaining_seconds(self):
+            return 480
+
+        async def reserve_model_call(self, bound, spec, *, after_response, minimum_seconds):
+            call_id = str(uuid4())
+            reserved.append(call_id)
+            self.call_meter.reserve(call_id, bound, spec)
+            return call_id
+
+    async def send():
+        sent.append(True)
+        await asyncio.sleep(0.05)
+
+    with pytest.raises(TimeoutError) as error:
+        await run_model_call(Guard(), CallSpec("semantic", "synthetic-semantic", "initial"),
+                             lambda: PreparedCall(100, send), timeout=0.001, after_response=False)
+    assert type(error.value) is TimeoutError
+    assert sent == [True] and len(reserved) == 1
+    with database() as session:
+        call = session.get(BrainModelCall, reserved[0])
+        assert call.state == "reserved"
+        assert session.get(BrainBuild, build.id).reserved_tokens == (existing + 1) * 100
+        assert session.get(BrainUnit, meter.unit_id).payload["_reserved_tokens"] == 100
+
+
+def test_timed_out_limit_is_part_of_recipe(monkeypatch):
+    from src.core.project_brain.lifecycle import recipe_hash
+
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 3)
+    before = recipe_hash()
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_MAX_TIMED_OUT_CALLS", 2)
+    assert recipe_hash() != before
 
 
 @pytest.mark.parametrize("fault", ["wrong_lease", "unknown"])

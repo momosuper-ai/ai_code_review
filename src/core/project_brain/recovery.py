@@ -13,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.core.project_brain.exceptions import SourceBindingError
 from src.core.project_brain.recipes import component_recipes, recipe_hash
@@ -616,7 +616,13 @@ def recovery_coverage(session, child_id):
 
 
 def _successful_unit_calls(session, unit, _seen=None):
-    from src.core.project_brain.usage import _call_group_identity, _http_error_valid, _unsent_valid, HTTP_ERROR_UNIT_LIMIT, CallSpec, validate_call_id
+    from src.config import settings
+    from src.core.project_brain.usage import (_call_group_identity, _http_error_valid, _timed_out_valid,
+        _unsent_valid, HTTP_ERROR_UNIT_LIMIT, CallSpec, validate_call_id)
+    timed_out_count = session.scalar(select(func.count()).select_from(BrainModelCall).where(
+        BrainModelCall.build_id == unit.build_id, BrainModelCall.state == "timed_out"))
+    if timed_out_count > settings.PROJECT_BRAIN_MAX_TIMED_OUT_CALLS:
+        return False
     calls = session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == unit.build_id,
         BrainModelCall.unit_id == unit.id)).all()
     if not calls:
@@ -656,7 +662,7 @@ def _successful_unit_calls(session, unit, _seen=None):
                 return False
         except (TypeError, ValueError):
             return False
-        if call.stage != unit.kind or call.state not in {"settled", "http_error", "unsent"}:
+        if call.stage != unit.kind or call.state not in {"settled", "http_error", "unsent", "timed_out"}:
             return False
         if call.state == "http_error":
             if not _http_error_valid(call) or call.transport_group is None:
@@ -664,6 +670,9 @@ def _successful_unit_calls(session, unit, _seen=None):
             closed += 1
         elif call.state == "unsent":
             if not _unsent_valid(call):
+                return False
+        elif call.state == "timed_out":
+            if not _timed_out_valid(call):
                 return False
         elif (call.http_status is not None or call.closed_at is not None or call.settled_at is None
               or type(call.usage_estimated) is not bool
@@ -677,7 +686,8 @@ def _successful_unit_calls(session, unit, _seen=None):
         return False
     for group in groups.values():
         group.sort(key=lambda call: call.transport_attempt)
-        if (group[-1].state not in {"settled", "unsent"} or any(call.state != "http_error" for call in group[:-1])
+        if (group[-1].state not in {"settled", "unsent", "timed_out"}
+                or any(call.state != "http_error" for call in group[:-1])
                 or any(call.transport_attempt != i or _call_group_identity(call) != _call_group_identity(group[0])
                        for i, call in enumerate(group, 1))):
             return False
@@ -749,10 +759,14 @@ def usage_lineage(session, build):
     if record and not ids:
         ids = [record.parent_build_id]
     parents = [session.get(BrainBuild, bid) for bid in dict.fromkeys(ids)]
+    timed_out = session.scalars(select(BrainModelCall).where(
+        BrainModelCall.build_id.in_(ids), BrainModelCall.state == "timed_out")).all()
     return {"reused_compile_units": len(record.imports or {}) if record else 0,
         "parent_build_ids": ids,
         "historical_settled_tokens": sum(p.total_prompt_tokens + p.total_completion_tokens for p in parents if p),
         "historical_budget_occupied_tokens": sum(p.reserved_tokens for p in parents if p),
         "historical_unknown_reserved_tokens": sum(call.reserved_tokens for call in session.scalars(
             select(BrainModelCall).where(BrainModelCall.build_id.in_(ids), BrainModelCall.state == "unknown"))),
+        "historical_timed_out_calls": len(timed_out),
+        "historical_timed_out_reserved_tokens": sum(call.reserved_tokens for call in timed_out),
         "historical_cost_is_new_usage": False, "parent_unknowns_preserved": True}

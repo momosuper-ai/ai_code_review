@@ -27,6 +27,13 @@ class PreparedCall:
     context: Any = None
 
 
+class ModelCallTimedOut(ModelTransportFailed):
+    failure_code = "model_call_timeout"
+
+    def __init__(self) -> None:
+        Exception.__init__(self, self.failure_code)
+
+
 def completed_http_error(exc: Exception) -> int | None:
     """Never infer closure from exception text, a status attribute or a stream."""
     if not isinstance(exc, APIStatusError):
@@ -114,6 +121,12 @@ async def run_model_call(guard, spec: CallSpec, prepare: Callable[[], PreparedCa
         except LateProjectionExceedsReservation:
             if guard.call_meter is not None and call_id is not None:
                 guard.call_meter.close_unsent(call_id, request.bound)
+            raise
+        except TimeoutError:
+            close_timeout = getattr(guard.call_meter, "close_timed_out", None)
+            if (guard.call_meter is not None and call_id is not None
+                    and callable(close_timeout) and close_timeout(call_id, request.bound)):
+                raise ModelCallTimedOut() from None
             raise
         except Exception as exc:
             status = completed_http_error(exc)
