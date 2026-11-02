@@ -616,7 +616,7 @@ def recovery_coverage(session, child_id):
 
 
 def _successful_unit_calls(session, unit, _seen=None):
-    from src.core.project_brain.usage import _call_group_identity, _http_error_valid, HTTP_ERROR_UNIT_LIMIT, CallSpec, validate_call_id
+    from src.core.project_brain.usage import _call_group_identity, _http_error_valid, _unsent_valid, HTTP_ERROR_UNIT_LIMIT, CallSpec, validate_call_id
     calls = session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == unit.build_id,
         BrainModelCall.unit_id == unit.id)).all()
     if not calls:
@@ -656,12 +656,15 @@ def _successful_unit_calls(session, unit, _seen=None):
                 return False
         except (TypeError, ValueError):
             return False
-        if call.stage != unit.kind or call.state not in {"settled", "http_error"}:
+        if call.stage != unit.kind or call.state not in {"settled", "http_error", "unsent"}:
             return False
         if call.state == "http_error":
             if not _http_error_valid(call) or call.transport_group is None:
                 return False
             closed += 1
+        elif call.state == "unsent":
+            if not _unsent_valid(call):
+                return False
         elif (call.http_status is not None or call.closed_at is not None or call.settled_at is None
               or type(call.usage_estimated) is not bool
               or any(type(number) is not int or number < 0 for number in
@@ -674,7 +677,7 @@ def _successful_unit_calls(session, unit, _seen=None):
         return False
     for group in groups.values():
         group.sort(key=lambda call: call.transport_attempt)
-        if (group[-1].state != "settled" or any(call.state != "http_error" for call in group[:-1])
+        if (group[-1].state not in {"settled", "unsent"} or any(call.state != "http_error" for call in group[:-1])
                 or any(call.transport_attempt != i or _call_group_identity(call) != _call_group_identity(group[0])
                        for i, call in enumerate(group, 1))):
             return False

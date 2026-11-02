@@ -7,10 +7,13 @@ import pytest
 from sqlalchemy import select
 
 from src.config import settings
+from src.core.project_brain.compiler import LateProjectionExceedsReservation
 from src.core.project_brain.exceptions import ModelTransportFailed, PrivacyResponseInvalid
 from src.core.project_brain.execution import pause_build, resume_build
 from src.core.project_brain.incremental import IncrementalRejected, accept_incremental
 from src.core.project_brain.lifecycle import BudgetExhausted, create_build
+from src.core.project_brain.transport import PreparedCall, run_model_call
+from src.core.project_brain.usage import BuildCallMeter, CallSpec
 from src.core.project_brain.trusted_packet import checkpoint_digest
 from src.models.brain import BrainBuild, BrainModelCall, BrainProject, BrainUnit, utcnow
 from src.tasks import brain_task
@@ -290,6 +293,7 @@ def test_incremental_reuses_matching_input_hash_despite_index_shift(database, mo
 @pytest.mark.parametrize("failure,countdowns", [
     (ModelTransportFailed("model_http_retry_exhausted"), [60, 120, 240]),
     (PrivacyResponseInvalid("invalid_json"), [60, 120, 240]),
+    (LateProjectionExceedsReservation(), [60, 120, 240]),
 ])
 def test_transient_unit_failures_retry_three_times_without_consuming_attempts(
         database, monkeypatch, failure, countdowns):
@@ -313,6 +317,52 @@ def test_transient_unit_failures_retry_three_times_without_consuming_attempts(
     assert [call.kwargs["countdown"] for call in dispatch.call_args_list] == countdowns
     assert all(call.kwargs == {"args": [unit_id], "countdown": delay, "queue": "brain", "retry": False}
                and call.args == () for call, delay in zip(dispatch.call_args_list, countdowns))
+
+
+def test_known_unsent_projection_failure_uses_existing_unit_retry(database, monkeypatch):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_ENABLED", True)
+    build_id, (unit_id,) = _build(database, commit="c" * 40)
+    sdk_calls = []
+
+    async def fail_before_io(unit, build, project, token):
+        meter = BuildCallMeter(build.id, unit.id, token)
+
+        class Guard:
+            call_meter = meter
+            ledger = None
+            calls = 0
+
+            def check_discoveries(self):
+                return None
+
+            def remaining_seconds(self):
+                return 480
+
+            async def reserve_model_call(self, bound, spec, *, after_response, minimum_seconds):
+                call_id = str(uuid4())
+                self.call_meter.reserve(call_id, bound, spec)
+                return call_id
+
+        async def send():
+            raise LateProjectionExceedsReservation()
+
+        await run_model_call(Guard(), CallSpec("semantic", "synthetic-semantic", "initial", 1),
+            lambda: PreparedCall(100, send), timeout=30, after_response=False)
+
+    monkeypatch.setattr(brain_task, "_execute", fail_before_io)
+    dispatch = MagicMock()
+    monkeypatch.setattr(brain_task.execute_brain_unit, "apply_async", dispatch)
+    assert brain_task.execute_brain_unit.run(unit_id) == {"status": "deferred"}
+    dispatch.assert_called_once_with(args=[unit_id], countdown=60, queue="brain", retry=False)
+
+    with database() as session:
+        call = session.scalar(select(BrainModelCall).where(
+            BrainModelCall.build_id == build_id, BrainModelCall.unit_id == unit_id))
+        unit, build = session.get(BrainUnit, unit_id), session.get(BrainBuild, build_id)
+        assert call.state == "unsent" and not sdk_calls
+        assert unit.status == "pending" and unit.diagnostic["transient_retries"] == 1
+        assert unit.diagnostic["last_failure"]["unknown_guard"] is False
+        assert build.status in {"pending", "scanning"}
 
 
 def test_unknown_call_preserves_original_diagnostic_and_never_retries(database, monkeypatch):

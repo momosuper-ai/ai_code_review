@@ -15,13 +15,13 @@ from src.core.gitlab_client import GitLabClient
 from src.core.project_brain import GENERATOR_VERSION
 from src.core.project_brain import timing
 from src.core.project_brain.artifacts import ArtifactStore, assemble_cards, validate
-from src.core.project_brain.compiler import CompilationGuard, CompilationLimitError, compile_packet, encoded, packet_hash, packets, sanitize_structure
+from src.core.project_brain.compiler import CompilationGuard, CompilationLimitError, LateProjectionExceedsReservation, compile_packet, encoded, packet_hash, packets, sanitize_structure
 from src.core.project_brain.extractor import FactExtractor
 from src.core.project_brain.exceptions import ModelCallsIncomplete, ModelTransportFailed, ModelWorkAdmissionDenied, PrivacyCheckpointMissing, PrivacyIdentityConflict, PrivacySealConflict, SourceBindingError, PrivacyResponseInvalid
 from src.core.project_brain.execution import ExecutionConflict, finish_pause, pause_build
 from src.core.project_brain.lifecycle import ACTIVE_STATES, BudgetBusy, BudgetExhausted, account_tokens, claim_unit, create_build, recipe_hash, reserve_tokens
 from src.core.project_brain.publisher import branch_fingerprint
-from src.core.project_brain.privacy import PrivacyLedger, PrivacyScanDeferred
+from src.core.project_brain.privacy import PrivacyLedger, PrivacyScanDeferred, project_placeholder_key
 from src.core.project_brain.privacy_history import HistoryCandidate, PrivacyHistory
 from src.core.project_brain.privacy_identity import SourceIdentityGuard
 from src.core.project_brain.privacy_projection import bundle_privacy_records, card_privacy_records, project_records
@@ -74,6 +74,8 @@ def _persist_timing(unit: BrainUnit) -> None:
 
 
 def _transient_failure_detail(exc: Exception) -> str:
+    if isinstance(exc, LateProjectionExceedsReservation):
+        return f"发送前安全投影超出已预留请求额度，预留已释放；failure_code={exc.failure_code}"
     if isinstance(exc, ModelTransportFailed):
         if exc.failure_code == "model_http_retry_exhausted":
             return f"临时HTTP错误已达到重试次数上限，费用预留保留；failure_code={exc.failure_code}"
@@ -319,11 +321,13 @@ def _guard_base(unit: BrainUnit, token: str, *, new_mode: bool = False, project_
     # Only extract establishes this build's key. Later units never recreate a
     # lost volume/key and mistake it for a valid empty discovery index.
     options = {"seal_directory": ArtifactStore().work_base / "source-seals" / unit.build_id} if new_mode else {}
-    ledger = PrivacyLedger(directory, create=not require_existing, require_index=new_mode, **options)
+    if new_mode and (type(project_id) is not int or project_id <= 0):
+        raise SourceBindingError()
+    placeholder_key = project_placeholder_key(ArtifactStore().work_base, project_id) if new_mode else None
+    ledger = PrivacyLedger(directory, create=not require_existing, require_index=new_mode,
+                           placeholder_key=placeholder_key, **options)
     history = None
     if new_mode:
-        if type(project_id) is not int or project_id <= 0:
-            raise SourceBindingError()
         history = _history_for(unit, project_id)
     guard = CompilationGuard(account, lambda amount: reserve_tokens(unit.build_id, token, unit.id, amount), ledger,
                             call_meter=BuildCallMeter(unit.build_id, unit.id, token),
@@ -415,6 +419,7 @@ def _model_usage_snapshot(session, build_id: str, assembler_id: int) -> dict:
     calls = session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == build_id)).all()
     closed = [call for call in calls if call.state == "http_error"]
     data = {"model_calls_settled": sum(call.state == "settled" for call in calls),
+            "model_calls_unsent": sum(call.state == "unsent" for call in calls),
             "model_calls_closed_http_errors": len(closed),
             "model_usage_unknown_bound_tokens": sum(call.reserved_tokens for call in closed),
             "model_usage_settled_tokens": build.total_prompt_tokens + build.total_completion_tokens,
@@ -901,6 +906,7 @@ def _complete(unit_id: int, token: str, result: dict) -> bool:
                 if not isinstance(sealed, dict) or set(sealed) != {"version", "revision", "content_digest", "binding_hmac"}:
                     raise PrivacySealConflict()
                 ledger = PrivacyLedger(ArtifactStore().directory(build.id, "work"), create=False,
+                    placeholder_key=project_placeholder_key(ArtifactStore().work_base, project.gitlab_project_id),
                     seal_directory=ArtifactStore().work_base / "source-seals" / build.id)
                 _assert_privacy_calls_settled(session, build.id, ledger)
                 if "model_usage_budget_occupied_tokens" in result["coverage"]:
@@ -1060,7 +1066,8 @@ def execute_brain_unit(self, unit_id: int) -> dict:
             }
             if unresolved is not None:
                 exc = ModelCallsIncomplete()
-            transient = isinstance(exc, (ModelTransportFailed, PrivacyResponseInvalid, ModelWorkAdmissionDenied))
+            transient = isinstance(exc, (ModelTransportFailed, PrivacyResponseInvalid, ModelWorkAdmissionDenied,
+                                         LateProjectionExceedsReservation))
             diagnostic = current.diagnostic if isinstance(current.diagnostic, dict) else {}
             transient_retries = diagnostic.get("transient_retries", 0)
             if type(transient_retries) is not int or transient_retries < 0:

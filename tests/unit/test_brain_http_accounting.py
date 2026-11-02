@@ -1,4 +1,5 @@
 """Terminal HTTP errors retain unknown costs and need their own retry success."""
+import asyncio
 from datetime import timedelta
 from uuid import uuid4
 
@@ -8,7 +9,9 @@ from sqlalchemy import select
 from src.config import settings
 from src.core.llm_client import TokenUsage
 from src.core.project_brain.exceptions import ModelCallsIncomplete
+from src.core.project_brain.compiler import LateProjectionExceedsReservation
 from src.core.project_brain.lifecycle import BudgetExhausted, claim_unit, create_build
+from src.core.project_brain.transport import PreparedCall, run_model_call
 from src.core.project_brain.usage import (
     HTTP_ERROR_UNIT_LIMIT, BuildCallMeter, CallSpec, abandon_reservation,
     assert_calls_terminal, usage_data,
@@ -60,6 +63,95 @@ def test_closed_error_retains_full_charge_and_own_success_does_not_clear_it(data
         assert row["closed_http_error_reserved_tokens"] == row["unknown_reserved_tokens"] == 100
         assert row["ambiguous_reserved_tokens"] == 0
     assert data["models"][0]["token_share_percent"] is None
+
+
+def test_known_unsent_releases_reservation_and_is_terminal(database):
+    unit, build, _, meter = claimed(database)
+    call_id = reserve_http(meter, str(uuid4()), bound=100)
+
+    meter.close_unsent(call_id, 100)
+
+    with database() as session:
+        call = session.get(BrainModelCall, call_id)
+        current = session.get(BrainBuild, build.id)
+        current_unit = session.get(BrainUnit, unit.id)
+        assert call.state == "unsent" and call.closed_at is not None
+        assert call.settled_at is None and call.http_status is None and call.response_model is None
+        assert (call.prompt_tokens, call.completion_tokens, call.cached_tokens) == (0, 0, 0)
+        assert call.usage_estimated is False
+        assert current.reserved_tokens == 0
+        assert current.total_prompt_tokens == current.total_completion_tokens == current.total_cached_tokens == 0
+        assert current_unit.payload["_reserved_tokens"] == current_unit.payload.get("_unknown_tokens", 0) == 0
+        assert_calls_terminal(session, build.id)
+    data = snapshot_usage(database, build.id)
+    assert data["total_tokens"] == 0
+    assert data["unknown_reserved_tokens"] == data["ambiguous_reserved_tokens"] == 0
+    for row in [*data["models"], *data["breakdown"]]:
+        assert row["unsent_calls"] == 1
+        assert row["total_tokens"] == row["unknown_reserved_tokens"] == 0
+
+
+@pytest.mark.parametrize("fault", ["wrong_lease", "unknown"])
+def test_close_unsent_refuses_wrong_lease_and_non_reserved_state_without_accounting_changes(database, fault):
+    unit, build, token, meter = claimed(database)
+    call_id = reserve_http(meter, str(uuid4()), bound=100)
+    if fault == "unknown":
+        with database() as session:
+            session.get(BrainModelCall, call_id).state = "unknown"
+            session.commit()
+    else:
+        meter = BuildCallMeter(build.id, unit.id, str(uuid4()))
+
+    with pytest.raises(ValueError):
+        meter.close_unsent(call_id, 100)
+
+    with database() as session:
+        call = session.get(BrainModelCall, call_id)
+        current = session.get(BrainBuild, build.id)
+        current_unit = session.get(BrainUnit, unit.id)
+        assert call.state == ("unknown" if fault == "unknown" else "reserved")
+        assert current.reserved_tokens == 100
+        assert current_unit.payload["_reserved_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_run_model_call_closes_pre_io_projection_failure_as_unsent(database):
+    unit, build, _, meter = claimed(database)
+    sdk_calls = []
+
+    class Guard:
+        call_meter = meter
+        ledger = None
+        calls = 0
+
+        def check_discoveries(self):
+            return None
+
+        def remaining_seconds(self):
+            return 480
+
+        async def reserve_model_call(self, bound, spec, *, after_response, minimum_seconds):
+            call_id = str(uuid4())
+            self.call_meter.reserve(call_id, bound, spec)
+            return call_id
+
+    async def send():
+        raise LateProjectionExceedsReservation()
+
+    with pytest.raises(LateProjectionExceedsReservation):
+        await run_model_call(Guard(), CallSpec("semantic", "synthetic-semantic", "initial", 1),
+            lambda: PreparedCall(100, send), timeout=30, after_response=False)
+
+    assert sdk_calls == []
+    with database() as session:
+        call = session.scalar(select(BrainModelCall).where(
+            BrainModelCall.build_id == build.id, BrainModelCall.unit_id == unit.id))
+        current = session.get(BrainBuild, build.id)
+        current_unit = session.get(BrainUnit, unit.id)
+        assert call.state == "unsent"
+        assert current.reserved_tokens == 0
+        assert current_unit.payload["_reserved_tokens"] == current_unit.payload.get("_unknown_tokens", 0) == 0
+        assert_calls_terminal(session, build.id)
 
 
 def test_close_is_idempotent_and_conflicting_repeat_cannot_change_charge(database):

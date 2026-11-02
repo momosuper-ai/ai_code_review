@@ -24,7 +24,7 @@ def test_ready_keeps_closed_cost_but_only_success_can_supply_privacy_origins(dat
         session.add(assembly)
         session.flush()
         data = _model_usage_snapshot(session, build.id, assembly.id)
-        assert data == {"model_calls_settled": 1, "model_calls_closed_http_errors": 1,
+        assert data == {"model_calls_settled": 1, "model_calls_unsent": 0, "model_calls_closed_http_errors": 1,
                         "model_usage_unknown_bound_tokens": 100, "model_usage_settled_tokens": 22,
                         "model_usage_budget_occupied_tokens": 122, "model_usage_financially_exact": False}
         metadata = {"context": {"build_id": build.id, "unit_id": unit.id, "stage": unit.kind}}

@@ -74,6 +74,11 @@ class BuildCallMeter:
         from src.core.project_brain.lifecycle import close_http_error
         return close_http_error(self.build_id, self.unit_id, self.lease_token, call_id, bound, status)
 
+    def close_unsent(self, call_id: str, bound: int) -> None:
+        """Release an authenticated reservation when local projection prevented I/O."""
+        from src.core.project_brain.lifecycle import close_unsent_call
+        close_unsent_call(self.build_id, self.unit_id, self.lease_token, call_id, bound)
+
 
 def _http_error_valid(call: BrainModelCall) -> bool:
     return (call.state == "http_error" and type(call.http_status) is int
@@ -83,6 +88,17 @@ def _http_error_valid(call: BrainModelCall) -> bool:
             and all(type(value) is int and value == 0
                     for value in (call.prompt_tokens, call.completion_tokens, call.cached_tokens))
             and type(call.reserved_tokens) is int and call.reserved_tokens > 0)
+
+
+def _unsent_valid(call: BrainModelCall) -> bool:
+    return (call.state == "unsent" and call.closed_at is not None and call.settled_at is None
+            and call.http_status is None and call.response_model is None
+            and type(call.usage_estimated) is bool and not call.usage_estimated
+            and all(type(value) is int and value == 0
+                    for value in (call.prompt_tokens, call.completion_tokens, call.cached_tokens))
+            and type(call.reserved_tokens) is int and call.reserved_tokens > 0
+            and call.transport_group is not None and type(call.transport_attempt) is int
+            and call.transport_attempt > 0)
 
 
 def _call_group_identity(call: BrainModelCall) -> tuple:
@@ -130,7 +146,7 @@ def assert_calls_terminal(session, build_id: str) -> None:
             spec.validate()
         except (TypeError, ValueError):
             raise ModelCallsIncomplete() from None
-        if call.state not in {"settled", "http_error"}:
+        if call.state not in {"settled", "http_error", "unsent"}:
             raise ModelCallsIncomplete()
         unit = units.get(call.unit_id)
         if unit is None or unit.build_id != build_id or unit.kind != call.stage:
@@ -141,6 +157,9 @@ def assert_calls_terminal(session, build_id: str) -> None:
             closed_bound += call.reserved_tokens
             closed_by_unit[call.unit_id] = closed_by_unit.get(call.unit_id, 0) + 1
             if closed_by_unit[call.unit_id] > HTTP_ERROR_UNIT_LIMIT:
+                raise ModelCallsIncomplete()
+        elif call.state == "unsent":
+            if not _unsent_valid(call):
                 raise ModelCallsIncomplete()
         else:
             if (call.http_status is not None or call.closed_at is not None
@@ -158,7 +177,7 @@ def assert_calls_terminal(session, build_id: str) -> None:
         identity = _call_group_identity(group[0])
         if (any(call.transport_attempt != index or _call_group_identity(call) != identity
                 for index, call in enumerate(group, 1))
-                or group[-1].state != "settled"
+                or group[-1].state not in {"settled", "unsent"}
                 or any(call.state != "http_error" for call in group[:-1])):
             raise ModelCallsIncomplete()
     actual = build.total_prompt_tokens + build.total_completion_tokens
@@ -203,7 +222,7 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
         key = (call.role, call.requested_model, call.response_model, call.stage, call.purpose)
         group = groups.setdefault(key, {"role": call.role, "requested_model": call.requested_model,
             "response_model": call.response_model, "stage": call.stage, "purpose": call.purpose,
-            "settled_calls": 0, "estimated_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
+            "settled_calls": 0, "estimated_calls": 0, "unsent_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
             "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens_subset": 0,
             "total_tokens": 0, "live_reserved_tokens": 0, "unknown_reserved_tokens": 0,
             "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})
@@ -230,6 +249,9 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
             closed_calls += 1
             closed += call.reserved_tokens
             states_valid = states_valid and _http_error_valid(call) and call.transport_group is not None
+        elif call.state == "unsent":
+            group["unsent_calls"] += 1
+            states_valid = states_valid and _unsent_valid(call)
         else:
             states_valid = states_valid and call.state in {"reserved", "unknown"}
             active = (call.state == "reserved" and build.status in {"pending", "scanning", "extracting", "compiling", "validating"}
@@ -257,7 +279,7 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
     for group in groups.values():
         key = (group["role"], group["requested_model"])
         model = model_totals.setdefault(key, {"role": key[0], "requested_model": key[1],
-            "settled_calls": 0, "estimated_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
+            "settled_calls": 0, "estimated_calls": 0, "unsent_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
             "prompt_tokens": 0, "completion_tokens": 0,
             "cached_tokens_subset": 0, "total_tokens": 0, "live_reserved_tokens": 0, "unknown_reserved_tokens": 0,
             "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})

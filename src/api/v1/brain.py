@@ -111,7 +111,7 @@ def _error_code(message: str | None, fallback: str) -> str | None:
     if not message:
         return None
     codes = {"source_identity_privacy_conflict", "source_binding_invalid", "privacy_checkpoint_missing", "privacy_seal_conflict", "known_privacy_regression", "model_calls_incomplete", "capacity_limit", "summary_output_capacity",
-             "output_privacy_window_exhausted", "retry_reasoning_privacy_window_exhausted", "privacy_response_invalid",
+             "output_privacy_window_exhausted", "retry_reasoning_privacy_window_exhausted", "late_projection_over_reservation", "privacy_response_invalid",
              "model_http_retry_exhausted", "model_http_retry_window_exhausted", "model_work_window_exhausted"}
     match = re.search(r"(?:^|[;；\s])failure_code=([a-z_]+)(?:$|[;；\s])", message)
     return match[1] if match and match[1] in codes else fallback

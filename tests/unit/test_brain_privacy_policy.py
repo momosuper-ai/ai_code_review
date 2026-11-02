@@ -61,6 +61,41 @@ def test_policy_same_occurrence_is_idempotent(tmp_path):
     assert item.index.read_bytes() == before
 
 
+def test_project_placeholder_numbers_are_stable_across_build_ledgers(tmp_path):
+    from src.core.project_brain.privacy import project_placeholder_key
+    from src.core.project_brain.source_catalog import identity_key
+
+    secret = "synthetic_project_credential"
+    identity_key(tmp_path, 480, create=True)
+    identity_key(tmp_path, 481, create=True)
+    placeholder_key = project_placeholder_key(tmp_path, 480)
+    other_project_key = project_placeholder_key(tmp_path, 481)
+    first = PrivacyLedger(tmp_path / "build-one", placeholder_key=placeholder_key)
+    second = PrivacyLedger(tmp_path / "build-two", placeholder_key=placeholder_key)
+    other_project = PrivacyLedger(tmp_path / "build-other-project", placeholder_key=other_project_key)
+    first.remember([{"value": secret, "type": "SECRET"}])
+    second.remember([{"value": secret, "type": "SECRET"}])
+    other_project.remember([{"value": secret, "type": "SECRET"}])
+    text = "token=" + secret
+
+    assert first.mask(text) == second.mask(text)
+    assert secret not in first.mask(text)
+    assert first.mask(text) != other_project.mask(text)
+
+
+def test_placeholder_key_controls_numbering_and_none_preserves_legacy(tmp_path):
+    secret = "synthetic_legacy_credential"
+    first = PrivacyLedger(tmp_path / "first", placeholder_key=b"a" * 32)
+    second = PrivacyLedger(tmp_path / "second", placeholder_key=b"b" * 32)
+    legacy = PrivacyLedger(tmp_path / "legacy")
+    for ledger in (first, second, legacy):
+        ledger.remember([{"value": secret, "type": "SECRET"}])
+
+    assert first.mask(secret) != second.mask(secret)
+    legacy_digest = legacy.digest("value:" + secret)
+    assert legacy.mask(secret) == f"<<SECRET_{int(legacy_digest[:16], 16)}>>"
+
+
 def test_policy_cannot_invent_a_value_or_sdk_origin(tmp_path):
     item = PrivacyLedger(tmp_path)
     with pytest.raises(ValueError):

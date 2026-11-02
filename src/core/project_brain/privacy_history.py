@@ -82,6 +82,7 @@ def _checked_ledger(key: bytes, raw: bytes, build_id: str) -> PrivacyLedger:
         # source file. Only these exact validated bytes will be frozen.
         ledger = object.__new__(PrivacyLedger)
         ledger.key, ledger.entries, ledger.origins = key, entries, origins
+        ledger.placeholder_key = None
         if "version" in data and not hmac.compare_digest(data["index_hmac"], ledger._index_binding(data)):
             _fail()
         ledger._verify_bindings(origins)

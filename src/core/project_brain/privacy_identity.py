@@ -93,7 +93,7 @@ def _filter_signature(privacy_filter) -> tuple | None:
                     or type(ledger.entries) is not dict):
                 return None
             entries = tuple(sorted((fingerprint, *record) for fingerprint, record in ledger.entries.items()))
-            ledger_state = (ledger.key, entries, _LEDGER_MASK, _LEDGER_DIGEST, _LEDGER_REFRESH,
+            ledger_state = (ledger.key, ledger.placeholder_key, entries, _LEDGER_MASK, _LEDGER_DIGEST, _LEDGER_REFRESH,
                             privacy_module._PLACEHOLDER.pattern, privacy_module._PLACEHOLDER.flags)
         return (kind, _IMPLEMENTATIONS, expected_method, _PLAIN_SANITIZE, _MAPPING_CREATE, ledger_state,
                 _patterns(privacy_filter._rules, rules=True),

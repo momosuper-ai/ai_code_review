@@ -106,10 +106,15 @@ async def run_model_call(guard, spec: CallSpec, prepare: Callable[[], PreparedCa
         # latest filter under the already reserved conservative upper bound.
         if privacy:
             guard.calls += 1
+        from src.core.project_brain.compiler import LateProjectionExceedsReservation
         try:
             with segment("model_call"):
                 result = await asyncio.wait_for(request.send(), timeout=timeout)
             return result, call_id, request
+        except LateProjectionExceedsReservation:
+            if guard.call_meter is not None and call_id is not None:
+                guard.call_meter.close_unsent(call_id, request.bound)
+            raise
         except Exception as exc:
             status = completed_http_error(exc)
             if status is None or guard.call_meter is None or call_id is None:

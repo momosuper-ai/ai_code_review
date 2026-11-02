@@ -70,6 +70,7 @@ def test_schema2_pending_display_has_no_private_coverage_or_error_text():
 
 @pytest.mark.parametrize("text, expected", [
     (f"{PRIVATE};failure_code=source_identity_privacy_conflict", "source_identity_privacy_conflict"),
+    ("failure_code=late_projection_over_reservation", "late_projection_over_reservation"),
     (f"failure_code={PRIVATE}", "unit_failed"),
     (None, None),
 ])
