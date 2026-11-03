@@ -46,7 +46,7 @@ _SOURCE_CACHE: tuple[tuple, SourceCatalog] | None = None
 
 def _safe_failure_metadata(exc: Exception) -> dict:
     metadata = {"exception": type(exc).__name__}
-    for name in ("failure_code", "reason", "phase", "after_response", "reservation_created",
+    for name in ("failure_code", "reason", "shape", "phase", "after_response", "reservation_created",
                  "remaining_seconds", "required_seconds"):
         if hasattr(exc, name):
             value = getattr(exc, name)

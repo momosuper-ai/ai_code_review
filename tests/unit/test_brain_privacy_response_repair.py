@@ -19,6 +19,11 @@ def response(items):
                       TokenUsage(10, 2), finish_reason="stop")
 
 
+def response_content(content):
+    return ChatResult(ChatCompletionMessage(role="assistant", content=content),
+                      TokenUsage(10, 2), finish_reason="stop")
+
+
 @pytest.fixture
 def scan(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "PRIVACY_FILTER_ENABLED", True)
@@ -82,6 +87,116 @@ async def test_invalid_whole_response_is_bounded_and_never_commits_partial_findi
     assert scan.guard.ledger.mask('AmberFixtureOnly') == 'AmberFixtureOnly'
     assert 'FixturePrivateOnly' not in '\n'.join(logs)
     assert all('FixturePrivateOnly' not in encoded(call.args) for call in scan.local.chat.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_invalid_shape_splits_multirecord_packet_and_completes_children(scan, monkeypatch):
+    records = [
+        {"field": "source_excerpt", "text": "FirstPacketTextMustStayPrivate"},
+        {"field": "source_excerpt", "text": "SecondPacketTextMustStayPrivate"},
+    ]
+    root_key = scan.guard.ledger.digest("packet:v2:" + encoded(records))
+    first_key = scan.guard.ledger.digest("packet:v2:" + encoded(records[:1]))
+    second_key = scan.guard.ledger.digest("packet:v2:" + encoded(records[1:]))
+    logs = []
+    monkeypatch.setattr("src.core.project_brain.compiler.logger.warning",
+                        lambda message, *args: logs.append(message % args))
+    scan.local.chat.side_effect = [response_content("{}") for _ in range(3)] + [response([]), response([])]
+
+    await scan.guard._scan(records, scan.scope, 0)
+
+    assert scan.local.chat.await_count == 5 and scan.charges == [12] * 5
+    assert scan.guard.ledger.receipt(root_key) == "completed"
+    assert scan.guard.ledger.receipt(first_key) == "completed"
+    assert scan.guard.ledger.receipt(second_key) == "completed"
+    assert "FirstPacketTextMustStayPrivate" not in "\n".join(logs)
+    assert "SecondPacketTextMustStayPrivate" not in "\n".join(logs)
+    assert any("知识隐私响应拆包重扫" in entry and "shape=empty_object" in entry for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_invalid_child_stops_before_second_half(scan):
+    records = scan.records + [{"field": "source_excerpt", "text": "Second complete synthetic record"}]
+    root_key = scan.guard.ledger.digest("packet:v2:" + encoded(records))
+    first_key = scan.guard.ledger.digest("packet:v2:" + encoded(records[:1]))
+    scan.local.chat.side_effect = [response_content("{}") for _ in range(6)]
+
+    with pytest.raises(PrivacyResponseInvalid) as error:
+        await scan.guard._scan(records, scan.scope, 0)
+
+    assert error.value.reason == "invalid_shape"
+    assert error.value.shape == "empty_object"
+    assert error.value.correction_exhausted is True
+    assert scan.local.chat.await_count == 6 and scan.charges == [12] * 6
+    assert scan.guard.ledger.receipt(root_key) == "split"
+    assert scan.guard.ledger.receipt(first_key) is None
+
+
+@pytest.mark.asyncio
+async def test_split_resume_skips_completed_parent_and_sibling(scan):
+    records = scan.records + [{"field": "source_excerpt", "text": "Second complete synthetic record"}]
+    root_key = scan.guard.ledger.digest("packet:v2:" + encoded(records))
+    first_key = scan.guard.ledger.digest("packet:v2:" + encoded(records[:1]))
+    second_key = scan.guard.ledger.digest("packet:v2:" + encoded(records[1:]))
+    scan.local.chat.side_effect = (
+        [response_content("{}") for _ in range(3)]
+        + [response([])]
+        + [response_content("{}") for _ in range(3)]
+    )
+
+    with pytest.raises(PrivacyResponseInvalid) as error:
+        await scan.guard._scan(records, scan.scope, 0)
+
+    assert error.value.correction_exhausted is True
+    assert scan.local.chat.await_count == 7
+    assert scan.guard.ledger.receipt(root_key) == "split"
+    assert scan.guard.ledger.receipt(first_key) == "completed"
+    assert scan.guard.ledger.receipt(second_key) is None
+
+    previous_calls = scan.local.chat.await_count
+    scan.local.chat.side_effect = [response([])]
+    await scan.guard._scan(records, scan.scope, 0)
+
+    assert scan.local.chat.await_count - previous_calls == 1
+    assert scan.guard.ledger.receipt(root_key) == "completed"
+    assert scan.guard.ledger.receipt(first_key) == "completed"
+    assert scan.guard.ledger.receipt(second_key) == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("content", "shape"), [
+    ("{}", "empty_object"),
+    ("[]", "array"),
+    ("null", "null"),
+    ("1", "scalar"),
+    ('{"x":[]}', "missing_items"),
+    ('{"items":[],"extra":1}', "extra_keys"),
+    ('{"items":null}', "items_not_list"),
+])
+async def test_invalid_shape_classifies_closed_response_shapes(scan, content, shape):
+    scan.local.chat.return_value = response_content(content)
+
+    with pytest.raises(PrivacyResponseInvalid) as error:
+        await scan.guard._scan(scan.records, scan.scope, 0)
+
+    assert error.value.reason == "invalid_shape"
+    assert error.value.shape == shape
+    assert error.value.correction_exhausted is True
+    assert scan.local.chat.await_count == 3 and scan.charges == [12] * 3
+
+
+@pytest.mark.asyncio
+async def test_invalid_shape_at_maximum_depth_does_not_split(scan):
+    records = scan.records + [{"field": "source_excerpt", "text": "Second complete synthetic record"}]
+    root_key = scan.guard.ledger.digest("packet:v2:" + encoded(records))
+    scan.local.chat.return_value = response_content("{}")
+
+    with pytest.raises(PrivacyResponseInvalid) as error:
+        await scan.guard._scan(records, scan.scope, 0, depth=8)
+
+    assert error.value.shape == "empty_object" and error.value.correction_exhausted is True
+    assert scan.local.chat.await_count == 3 and scan.charges == [12] * 3
+    assert scan.guard.ledger.receipt(root_key) is None
 
 
 @pytest.mark.asyncio
@@ -155,7 +270,7 @@ async def test_reference_validator_never_fuzzy_matches_names_joined_fields_or_js
     scan.local.chat.return_value = response([{'value': content, 'type': 'SECRET'}])
     with pytest.raises(PrivacyResponseInvalid):
         await scan.guard._scan(records, scan.scope, 0)
-    assert scan.local.chat.await_count == 3
+    assert scan.local.chat.await_count == 6 and scan.charges == [12] * 6
 
 
 @pytest.mark.asyncio
@@ -183,6 +298,13 @@ def test_error_metadata_and_api_are_closed():
     for reason in ['FixturePrivateOnly', {}, None, 2]:
         with pytest.raises(ValueError):
             PrivacyResponseInvalid(reason)
+    with pytest.raises(ValueError):
+        PrivacyResponseInvalid("invalid_shape", shape="unlisted")
+    with pytest.raises(ValueError):
+        PrivacyResponseInvalid("empty_value", shape="empty_object")
+    from src.tasks.brain_task import _safe_failure_metadata
+    metadata = _safe_failure_metadata(PrivacyResponseInvalid("invalid_shape", shape="empty_object"))
+    assert metadata["shape"] == "empty_object"
 
 
 def test_exhausted_scan_defers_once_and_preserves_each_call_bill(scan, database, monkeypatch):

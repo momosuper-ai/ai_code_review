@@ -880,8 +880,17 @@ class CompilationGuard:
             response = json.loads(result.message.content or "")
         except json.JSONDecodeError:
             raise PrivacyResponseInvalid("invalid_json") from None
-        if not isinstance(response, dict) or set(response) != {"items"} or not isinstance(response["items"], list):
-            raise PrivacyResponseInvalid("invalid_shape")
+        if not isinstance(response, dict):
+            shape = "array" if isinstance(response, list) else "null" if response is None else "scalar"
+            raise PrivacyResponseInvalid("invalid_shape", shape=shape)
+        if not response:
+            raise PrivacyResponseInvalid("invalid_shape", shape="empty_object")
+        if "items" not in response:
+            raise PrivacyResponseInvalid("invalid_shape", shape="missing_items")
+        if set(response) != {"items"}:
+            raise PrivacyResponseInvalid("invalid_shape", shape="extra_keys")
+        if not isinstance(response["items"], list):
+            raise PrivacyResponseInvalid("invalid_shape", shape="items_not_list")
         for item in response["items"]:
             if (not isinstance(item, dict) or set(item) != {"value", "type"}
                     or type(item["value"]) is not str or type(item["type"]) is not str or item["type"] not in TYPES):
@@ -909,16 +918,37 @@ class CompilationGuard:
                     # must not multiply retries or replay completed siblings.
                     raise
                 rejected = error
-                logger.warning("知识隐私响应拒绝：failure_code=%s reason=%s correction_attempt=%d",
-                               error.failure_code, error.reason, correction)
+                logger.warning("知识隐私响应拒绝：failure_code=%s reason=%s shape=%s correction_attempt=%d",
+                               error.failure_code, error.reason, error.shape, correction)
             except (PrivacyScanDeferred, BudgetBusy):
                 if rejected is not None:
                     # A continuation would forget the bounded correction count
                     # and repeat a paid invalid packet indefinitely.
-                    raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True) from None
+                    raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True,
+                                                 shape=rejected.shape) from None
                 raise
         assert rejected is not None
-        raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True) from None
+        if len(records) > 1 and depth < 8:
+            logger.warning("知识隐私响应拆包重扫：failure_code=%s reason=%s shape=%s records=%d depth=%d",
+                           rejected.failure_code, rejected.reason, rejected.shape, len(records), depth)
+            key = self.ledger.digest("packet:v2:" + encoded(records)) if self.ledger else ""
+            await self._split(records, scope, start, depth, key)
+            return
+        raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True,
+                                     shape=rejected.shape) from None
+
+    async def _split(self, records: list[dict], scope: str, start: int, depth: int, key: str) -> None:
+        if len(records) <= 1 or depth >= 8:
+            raise CompilationLimitError("隐私扫描单个字段的输出仍被截断，停止该单元")
+        if self.ledger:
+            self.reserve(0)
+            self.ledger.complete(key, "split")
+        middle = len(records) // 2
+        await self._scan(records[:middle], scope, start, depth + 1)
+        await self._scan(records[middle:], scope, start + middle, depth + 1)
+        if self.ledger:
+            self.reserve(0)
+            self.ledger.complete(key)
 
     async def _scan_once(self, records: list[dict], scope: str, start: int, depth: int, *,
                          correction_reason: str | None, correction_attempt: int) -> None:
@@ -1029,14 +1059,7 @@ class CompilationGuard:
             if self.ledger:
                 self.reserve(0)
                 self.ledger.complete(key, "split")
-        if len(records) <= 1 or depth >= 8:
-            raise CompilationLimitError("隐私扫描单个字段的输出仍被截断，停止该单元")
-        middle = len(records) // 2
-        await self._scan(records[:middle], scope, start, depth + 1)
-        await self._scan(records[middle:], scope, start + middle, depth + 1)
-        if self.ledger:
-            self.reserve(0)
-            self.ledger.complete(key)
+        await self._split(records, scope, start, depth, key)
 
     def _account(self, usage: TokenUsage, messages: object, output: str, bound: int, *,
                  call_id: str | None = None, response_model: str | None = None) -> None:
