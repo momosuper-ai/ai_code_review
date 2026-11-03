@@ -66,6 +66,7 @@ class BrainBuild(Base):
     source_fingerprint: Mapped[str | None] = mapped_column(String(64))
     artifact_path: Mapped[str | None] = mapped_column(String(500))
     coverage: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostic: Mapped[dict | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)
     total_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -94,6 +95,7 @@ class BrainUnit(Base):
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     result: Mapped[dict | None] = mapped_column(JSON)
+    diagnostic: Mapped[dict | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)
 
 

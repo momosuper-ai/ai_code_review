@@ -66,14 +66,19 @@ class PrivacyResponseInvalid(ValueError):
 
     failure_code = "privacy_response_invalid"
     REASONS = frozenset({"invalid_json", "invalid_shape", "invalid_item", "empty_value", "value_not_in_input"})
+    SHAPES = frozenset({"empty_object", "array", "null", "scalar", "missing_items", "extra_keys", "items_not_list"})
 
-    def __init__(self, reason: str, *, correction_exhausted: bool = False) -> None:
-        if type(reason) is not str or reason not in self.REASONS or type(correction_exhausted) is not bool:
+    def __init__(self, reason: str, *, correction_exhausted: bool = False, shape: str | None = None) -> None:
+        if (type(reason) is not str or reason not in self.REASONS or type(correction_exhausted) is not bool
+                or shape is not None and (type(shape) is not str or shape not in self.SHAPES)
+                or reason != "invalid_shape" and shape is not None):
             raise ValueError("隐私响应错误类别无效")
         self.reason = reason
         self.correction_exhausted = correction_exhausted
+        self.shape = shape
         label = "本地隐私扫描引用无效" if reason in {"empty_value", "value_not_in_input"} else "本地隐私扫描格式无效"
-        super().__init__(f"{label}；failure_code={self.failure_code} reason={reason}")
+        shape_label = f" shape={shape}" if shape is not None else ""
+        super().__init__(f"{label}；failure_code={self.failure_code} reason={reason}{shape_label}")
 
 
 class ModelTransportFailed(Exception):
@@ -90,13 +95,18 @@ class ModelWorkAdmissionDenied(Exception):
 
     failure_code = "model_work_window_exhausted"
 
-    def __init__(self, reason: str, phase: str, *, after_response: bool) -> None:
+    def __init__(self, reason: str, phase: str, *, after_response: bool,
+                 remaining_seconds: int | None = None, required_seconds: int | None = None) -> None:
         if (type(reason) is not str or reason not in {"deadline", "call_limit"}
                 or type(phase) is not str or phase not in {"before_prepare", "before_reserve", "after_reserve"}
-                or type(after_response) is not bool):
+                or type(after_response) is not bool
+                or remaining_seconds is not None and (type(remaining_seconds) is not int or remaining_seconds < 0)
+                or required_seconds is not None and (type(required_seconds) is not int or required_seconds < 0)):
             raise ValueError("模型工作准入诊断字段无效")
         self.reason = reason
         self.phase = phase
         self.after_response = after_response
         self.reservation_created = phase == "after_reserve"
+        self.remaining_seconds = remaining_seconds
+        self.required_seconds = required_seconds
         super().__init__(self.failure_code)

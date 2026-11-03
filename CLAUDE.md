@@ -195,6 +195,10 @@ PostgreSQL + SQLAlchemy 双引擎设计。三张表：`reviews`（审查记录�
 - `GET /api/v1/reviews` — 审查记录列表（分页、按 project_id/status 过滤，需 API Key，速率限制 60/min）
 - `GET /api/v1/reviews/{review_id}` — 审查详情（含关联 comments，需 API Key，速率限制 60/min）
 
+## Project Brain
+
+`src/core/project_brain/` implements versioned, evidence-backed knowledge generation; migrations `005`–`011` track its schema. Unit diagnostics and fixed-name timing are persisted in nullable JSON fields. Transient retry/backoff and breaker settings live in `src/config.py`; schema2 cross-commit compile reuse is implemented in `incremental.py` and revalidates privacy/source-privacy fully. A client-side `asyncio.wait_for` timeout may close as `timed_out`, retaining the full reserved bound as build charge and using the existing unit retry; `PROJECT_BRAIN_MAX_TIMED_OUT_CALLS` defaults to 3 per build, while 0 or a reached cap preserves the legacy unknown path. Lease loss, worker crashes, sleep, and other uncertain outcomes retain existing unknown handling. Privacy/evidence checks and budget limits remain terminal gates. `scripts/brain_timing_report.py` reads timing data with SELECT-only queries.
+
 ## Tech Stack
 
 Python 3.12, FastAPI, SQLAlchemy asyncpg, Celery + Redis, httpx, OpenAI SDK, filelock. Docker Compose 编排 4 个服务（api, celery, postgres, redis）。

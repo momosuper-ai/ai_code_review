@@ -74,6 +74,16 @@ class BuildCallMeter:
         from src.core.project_brain.lifecycle import close_http_error
         return close_http_error(self.build_id, self.unit_id, self.lease_token, call_id, bound, status)
 
+    def close_unsent(self, call_id: str, bound: int) -> None:
+        """Release an authenticated reservation when local projection prevented I/O."""
+        from src.core.project_brain.lifecycle import close_unsent_call
+        close_unsent_call(self.build_id, self.unit_id, self.lease_token, call_id, bound)
+
+    def close_timed_out(self, call_id: str, bound: int) -> bool:
+        """Retain a bounded charge for a client-side wait_for timeout."""
+        from src.core.project_brain.lifecycle import close_timed_out_call
+        return close_timed_out_call(self.build_id, self.unit_id, self.lease_token, call_id, bound)
+
 
 def _http_error_valid(call: BrainModelCall) -> bool:
     return (call.state == "http_error" and type(call.http_status) is int
@@ -83,6 +93,34 @@ def _http_error_valid(call: BrainModelCall) -> bool:
             and all(type(value) is int and value == 0
                     for value in (call.prompt_tokens, call.completion_tokens, call.cached_tokens))
             and type(call.reserved_tokens) is int and call.reserved_tokens > 0)
+
+
+def _unsent_valid(call: BrainModelCall) -> bool:
+    return (call.state == "unsent" and call.closed_at is not None and call.settled_at is None
+            and call.http_status is None and call.response_model is None
+            and type(call.usage_estimated) is bool and not call.usage_estimated
+            and all(type(value) is int and value == 0
+                    for value in (call.prompt_tokens, call.completion_tokens, call.cached_tokens))
+            and type(call.reserved_tokens) is int and call.reserved_tokens > 0
+            and call.transport_group is not None and type(call.transport_attempt) is int
+            and call.transport_attempt > 0)
+
+
+def _timed_out_valid(call: BrainModelCall) -> bool:
+    if (call.state != "timed_out" or call.closed_at is None or call.settled_at is not None
+            or call.http_status is not None or call.response_model is not None
+            or type(call.usage_estimated) is not bool or call.usage_estimated
+            or any(type(value) is not int or value != 0
+                   for value in (call.prompt_tokens, call.completion_tokens, call.cached_tokens))
+            or type(call.reserved_tokens) is not int or call.reserved_tokens <= 0
+            or call.transport_group is None or type(call.transport_attempt) is not int
+            or call.transport_attempt <= 0):
+        return False
+    try:
+        validate_call_id(call.transport_group)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _call_group_identity(call: BrainModelCall) -> tuple:
@@ -121,7 +159,7 @@ def assert_calls_terminal(session, build_id: str) -> None:
     calls = session.scalars(select(BrainModelCall).where(BrainModelCall.build_id == build_id)).all()
     units = {unit.id: unit for unit in session.scalars(select(BrainUnit).where(BrainUnit.build_id == build_id))}
     groups, closed_by_unit = {}, {}
-    prompt = completion = cached = closed_bound = 0
+    prompt = completion = cached = closed_bound = timed_out_bound = timed_out_calls = 0
     for call in calls:
         try:
             validate_call_id(call.id)
@@ -130,7 +168,7 @@ def assert_calls_terminal(session, build_id: str) -> None:
             spec.validate()
         except (TypeError, ValueError):
             raise ModelCallsIncomplete() from None
-        if call.state not in {"settled", "http_error"}:
+        if call.state not in {"settled", "http_error", "unsent", "timed_out"}:
             raise ModelCallsIncomplete()
         unit = units.get(call.unit_id)
         if unit is None or unit.build_id != build_id or unit.kind != call.stage:
@@ -142,6 +180,14 @@ def assert_calls_terminal(session, build_id: str) -> None:
             closed_by_unit[call.unit_id] = closed_by_unit.get(call.unit_id, 0) + 1
             if closed_by_unit[call.unit_id] > HTTP_ERROR_UNIT_LIMIT:
                 raise ModelCallsIncomplete()
+        elif call.state == "unsent":
+            if not _unsent_valid(call):
+                raise ModelCallsIncomplete()
+        elif call.state == "timed_out":
+            if not _timed_out_valid(call):
+                raise ModelCallsIncomplete()
+            timed_out_calls += 1
+            timed_out_bound += call.reserved_tokens
         else:
             if (call.http_status is not None or call.closed_at is not None
                     or any(type(value) is not int or value < 0 for value in
@@ -158,16 +204,18 @@ def assert_calls_terminal(session, build_id: str) -> None:
         identity = _call_group_identity(group[0])
         if (any(call.transport_attempt != index or _call_group_identity(call) != identity
                 for index, call in enumerate(group, 1))
-                or group[-1].state != "settled"
+                or group[-1].state not in {"settled", "unsent", "timed_out"}
                 or any(call.state != "http_error" for call in group[:-1])):
             raise ModelCallsIncomplete()
+    if timed_out_calls > settings.PROJECT_BRAIN_MAX_TIMED_OUT_CALLS:
+        raise ModelCallsIncomplete()
     actual = build.total_prompt_tokens + build.total_completion_tokens
     if (any(type(value) is not int or value < 0 for value in
             (build.total_prompt_tokens, build.total_completion_tokens, build.total_cached_tokens, build.reserved_tokens))
             or cached > build.total_cached_tokens or prompt > build.total_prompt_tokens
             or completion > build.total_completion_tokens
             or build.total_cached_tokens > build.total_prompt_tokens
-            or build.reserved_tokens != actual + closed_bound
+            or build.reserved_tokens != actual + closed_bound + timed_out_bound
             or (build.usage_tracking_version == 1 and (prompt != build.total_prompt_tokens
                  or completion != build.total_completion_tokens or cached != build.total_cached_tokens))):
         raise ModelCallsIncomplete()
@@ -196,17 +244,18 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
     """Shares use the whole build denominator, never silently discard legacy costs."""
     groups = {}
     attributed_prompt = attributed_completion = attributed_cached = estimated_tokens = 0
-    live = unknown = settled = closed = closed_calls = 0
+    live = unknown = settled = closed = closed_calls = timed_out_calls = timed_out = 0
     states_valid = True
     now = utcnow()
     for call, unit in rows:
         key = (call.role, call.requested_model, call.response_model, call.stage, call.purpose)
         group = groups.setdefault(key, {"role": call.role, "requested_model": call.requested_model,
             "response_model": call.response_model, "stage": call.stage, "purpose": call.purpose,
-            "settled_calls": 0, "estimated_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
+            "settled_calls": 0, "estimated_calls": 0, "unsent_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
             "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens_subset": 0,
             "total_tokens": 0, "live_reserved_tokens": 0, "unknown_reserved_tokens": 0,
-            "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})
+            "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0,
+            "timed_out_calls": 0, "timed_out_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})
         if call.state == "settled":
             count = call.prompt_tokens + call.completion_tokens
             group["settled_calls"] += 1
@@ -230,6 +279,15 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
             closed_calls += 1
             closed += call.reserved_tokens
             states_valid = states_valid and _http_error_valid(call) and call.transport_group is not None
+        elif call.state == "unsent":
+            group["unsent_calls"] += 1
+            states_valid = states_valid and _unsent_valid(call)
+        elif call.state == "timed_out":
+            group["timed_out_calls"] += 1
+            group["timed_out_reserved_tokens"] += call.reserved_tokens
+            timed_out_calls += 1
+            timed_out += call.reserved_tokens
+            states_valid = states_valid and _timed_out_valid(call)
         else:
             states_valid = states_valid and call.state in {"reserved", "unknown"}
             active = (call.state == "reserved" and build.status in {"pending", "scanning", "extracting", "compiling", "validating"}
@@ -243,24 +301,27 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
                 group["ambiguous_reserved_tokens"] += call.reserved_tokens
                 unknown += call.reserved_tokens
     total = build.total_prompt_tokens + build.total_completion_tokens
+    states_valid = states_valid and timed_out_calls <= settings.PROJECT_BRAIN_MAX_TIMED_OUT_CALLS
     attributed = attributed_prompt + attributed_completion
     untracked = total - attributed
     untracked_cached = build.total_cached_tokens - attributed_cached
-    untracked_reserved = build.reserved_tokens - attributed - live - unknown - closed
+    untracked_reserved = build.reserved_tokens - attributed - live - unknown - closed - timed_out
     consistent = (states_valid and untracked >= 0 and untracked_reserved >= 0 and attributed_prompt <= build.total_prompt_tokens
                   and attributed_completion <= build.total_completion_tokens and attributed_cached <= build.total_cached_tokens)
     coverage = ("inconsistent" if not consistent else "legacy_unattributed" if not rows and total > 0
                 else "complete" if build.usage_tracking_version == 1 and untracked == 0 and untracked_reserved == 0 and untracked_cached == 0
                 else "partial")
-    exact = coverage == "complete" and not build.usage_estimated and estimated_tokens == 0 and live == unknown == closed == 0
+    exact = (coverage == "complete" and not build.usage_estimated and estimated_tokens == 0
+             and live == unknown == closed == timed_out == 0)
     model_totals = {}
     for group in groups.values():
         key = (group["role"], group["requested_model"])
         model = model_totals.setdefault(key, {"role": key[0], "requested_model": key[1],
-            "settled_calls": 0, "estimated_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
+            "settled_calls": 0, "estimated_calls": 0, "unsent_calls": 0, "reserved_calls": 0, "unknown_calls": 0,
             "prompt_tokens": 0, "completion_tokens": 0,
             "cached_tokens_subset": 0, "total_tokens": 0, "live_reserved_tokens": 0, "unknown_reserved_tokens": 0,
-            "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})
+            "closed_http_error_calls": 0, "closed_http_error_reserved_tokens": 0,
+            "timed_out_calls": 0, "timed_out_reserved_tokens": 0, "ambiguous_reserved_tokens": 0})
         for name in tuple(model)[2:]:
             model[name] += group[name]
     for model in model_totals.values():
@@ -276,9 +337,10 @@ def usage_data(build: BrainBuild, rows: list[tuple[BrainModelCall, BrainUnit | N
             "estimated_tokens": estimated_tokens, "live_reserved_tokens": live,
             "unknown_reserved_tokens": unknown + closed, "ambiguous_reserved_tokens": unknown,
             "closed_http_error_calls": closed_calls, "closed_http_error_reserved_tokens": closed,
+            "timed_out_calls": timed_out_calls, "timed_out_reserved_tokens": timed_out,
             "unattributed_reserved_tokens": untracked_reserved,
             "models": [model_totals[key] for key in sorted(model_totals)],
             "breakdown": [groups[key] for key in sorted(groups, key=lambda key: tuple(value or "" for value in key))],
             "currency_cost": None,
             "identity_policy": "requested_model为网关别名；response_model仅保留与配置别名一致的报告值，其他值不落盘，不证明实际后端身份",
-            "share_policy": "仅全量归属且无估算/未知/活动预留时给整构建占比；HTTP错误费用仍未知且保留完整预留；cached是prompt子集，不重复扣除"}
+            "share_policy": "仅全量归属且无估算/未知/活动预留或已发送超时时给整构建占比；HTTP错误和已发送超时保留完整预留；cached是prompt子集，不重复扣除"}

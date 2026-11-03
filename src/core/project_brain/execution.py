@@ -184,4 +184,11 @@ def resume_build(session, build_id: str) -> BrainBuild:
         if unit.status == "pending":
             unit.dispatched_at = None
     build.execution_state, build.resumed_at = "running", utcnow()
+    diagnostic = build.diagnostic if isinstance(build.diagnostic, dict) else {}
+    breaker = diagnostic.get("breaker")
+    if isinstance(breaker, dict) and breaker.get("state") == "tripped":
+        build.diagnostic = {
+            **diagnostic,
+            "breaker": {**breaker, "events": [], "state": "closed"},
+        }
     return build

@@ -380,7 +380,7 @@ def _safe_fixed_tree(value: object, sanitize: Callable[[str], str]) -> object:
 
 
 _COUNT_COVERAGE = {"files", "available_files", "facts", "relations", "resolved_relations", "evidence", "cards", "limitations", "reused_files", "cache_hits", "privacy_history_parents", "privacy_history_legacy_unavailable", "privacy_policy_findings",
-                   "model_calls_settled", "model_calls_closed_http_errors", "model_usage_unknown_bound_tokens",
+                   "model_calls_settled", "model_calls_unsent", "model_calls_closed_http_errors", "model_usage_unknown_bound_tokens",
                    "model_usage_settled_tokens", "model_usage_budget_occupied_tokens"}
 _RATIO_COVERAGE = {"valid_reference_ratio", "evidence_coverage_ratio", "source_reference_coverage_ratio"}
 _PLAN_COUNTS = {"semantic_packets", "canonical_bytes", "wire_bytes", "estimated_semantic_input_tokens", "reservation_envelope", "budget_tokens"}

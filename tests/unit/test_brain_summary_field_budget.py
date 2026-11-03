@@ -3,6 +3,7 @@ import pytest
 from openai.types.chat import ChatCompletionMessage
 
 from src.config import settings
+from src.core.project_brain import compiler
 from src.core.project_brain.compiler import CompilationLimitError, compilation_transport, compile_packet, encoded
 from src.core.project_brain.context import compact_packet
 from src.core.project_brain.source_bound import SourceBoundPlan
@@ -106,6 +107,44 @@ async def test_provider_ignoring_field_limits_is_corrected_locally(synthesis, tr
     params = mock.kwargs[0]["tools"][0]["function"]["parameters"]
     assert "maxLength" not in encoded(params)
     assert str(budget.text_chars) in params["$defs"]["SlotText"]["properties"]["texts"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_late_projection_keeps_level_one_summary_budget_after_field_retry(synthesis, transport, monkeypatch):
+    monkeypatch.setattr(settings, "PROJECT_BRAIN_SEMANTIC_OUTPUT_MODE", "source_bound")
+    monkeypatch.setattr(settings, "AGENT_FORMAT_RETRY_MAX", 1)
+    displays = {ref.path: ref.path for ref in transport.bundle.source_refs}
+    transport.guard.packet_projection = lambda packet, privacy: compiler.project_packet_texts(packet, privacy, displays)
+    budget = summary_field_budget(settings.PROJECT_BRAIN_PACKET_MAX_TOKENS, 0)
+    oversized = response()
+    oversized["slots"]["S1"]["texts"] = ["短文"] * (budget.text_count + 1)
+    mock = model(monkeypatch, [formatter_result(encoded(oversized)), formatter_result(encoded(response()))])
+    projected_bounds = []
+    original = compiler.ProjectedMessageFilter.sanitize_messages
+
+    def capture_projection(message_filter, messages):
+        projected = original(message_filter, messages)
+        projected_bounds.append((
+            message_filter.summary_budget_level,
+            message_filter.reserved_bound,
+            compiler.token_bound(compiler.encoded(
+                compiler.semantic_request(projected, message_filter.transport_kwargs))) + message_filter.output_limit,
+        ))
+        return projected
+
+    monkeypatch.setattr(compiler.ProjectedMessageFilter, "sanitize_messages", capture_projection)
+    await compile_packet(synthesis, transport.guard)
+
+    assert len(mock.calls) == 2
+    assert "summary_budget_level=1" in mock.calls[1][0]["content"]
+    sent_schema = mock.kwargs[1]["tools"][0]["function"]["parameters"]
+    level_one_budget = summary_field_budget(settings.PROJECT_BRAIN_PACKET_MAX_TOKENS, 1)
+    level_zero_budget = summary_field_budget(settings.PROJECT_BRAIN_PACKET_MAX_TOKENS, 0)
+    assert str(level_one_budget.text_chars) in sent_schema["$defs"]["SlotText"]["properties"]["texts"]["items"]["description"]
+    assert level_one_budget.text_chars < level_zero_budget.text_chars
+    assert len(projected_bounds) == 2
+    assert projected_bounds[1][0] == 1
+    assert projected_bounds[1][2] <= projected_bounds[1][1]
 
 
 def test_public_error_code_distinguishes_summary_output_from_input_capacity():

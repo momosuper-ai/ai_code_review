@@ -139,10 +139,17 @@ class CompilationLimitError(ValueError):
     """A closed capacity diagnostic; truncating evidence is forbidden."""
 
     def __init__(self, message: str, *, failure_code: str = "capacity_limit") -> None:
-        if failure_code not in {"capacity_limit", "summary_output_capacity", "output_privacy_window_exhausted", "retry_reasoning_privacy_window_exhausted"}:
+        if failure_code not in {"capacity_limit", "summary_output_capacity", "output_privacy_window_exhausted",
+                                "retry_reasoning_privacy_window_exhausted", "late_projection_over_reservation"}:
             raise ValueError("知识容量错误码无效")
         self.failure_code = failure_code
         super().__init__(message)
+
+
+class LateProjectionExceedsReservation(CompilationLimitError):
+    def __init__(self) -> None:
+        super().__init__("发送前安全投影超出已预留请求额度",
+                         failure_code="late_projection_over_reservation")
 
 
 def encoded(value: object) -> str:
@@ -488,17 +495,20 @@ class ProjectedMessageFilter:
         self.reserved_bound: int | None = None
         self.output_limit = 0
         self.transport_kwargs: dict = {}
+        self.summary_budget_level = 0
 
-    def bind_reservation(self, bound: int, output_limit: int, kwargs: dict) -> None:
+    def bind_reservation(self, bound: int, output_limit: int, kwargs: dict, summary_budget_level: int = 0) -> None:
         """Late projection must fit the exact already reserved request budget."""
         self.reserved_bound, self.output_limit, self.transport_kwargs = bound, output_limit, kwargs
+        self.summary_budget_level = summary_budget_level
 
     def sanitize_messages(self, messages: list) -> list[dict]:
         safe = self.guard.project_packet(self.packet)
         context = compact_packet(safe)
         initial, _, _ = compilation_transport(safe, context,
             canonical_digest=self.canonical_digest,
-            canonical_relation_digest=self.canonical_relation_digest)
+            canonical_relation_digest=self.canonical_relation_digest,
+            summary_budget_level=self.summary_budget_level)
         if len(messages) < 2:
             raise ValueError("知识传输消息结构无效")
         result = copy.deepcopy(initial)
@@ -513,7 +523,7 @@ class ProjectedMessageFilter:
             if bound > self.reserved_bound:
                 # The call has been durably reserved but no SDK I/O occurred.
                 # Do not send an expanded late projection on a smaller grant.
-                raise CompilationLimitError("发送前安全投影超出已预留请求额度")
+                raise LateProjectionExceedsReservation()
         return result
 
 
@@ -870,8 +880,17 @@ class CompilationGuard:
             response = json.loads(result.message.content or "")
         except json.JSONDecodeError:
             raise PrivacyResponseInvalid("invalid_json") from None
-        if not isinstance(response, dict) or set(response) != {"items"} or not isinstance(response["items"], list):
-            raise PrivacyResponseInvalid("invalid_shape")
+        if not isinstance(response, dict):
+            shape = "array" if isinstance(response, list) else "null" if response is None else "scalar"
+            raise PrivacyResponseInvalid("invalid_shape", shape=shape)
+        if not response:
+            raise PrivacyResponseInvalid("invalid_shape", shape="empty_object")
+        if "items" not in response:
+            raise PrivacyResponseInvalid("invalid_shape", shape="missing_items")
+        if set(response) != {"items"}:
+            raise PrivacyResponseInvalid("invalid_shape", shape="extra_keys")
+        if not isinstance(response["items"], list):
+            raise PrivacyResponseInvalid("invalid_shape", shape="items_not_list")
         for item in response["items"]:
             if (not isinstance(item, dict) or set(item) != {"value", "type"}
                     or type(item["value"]) is not str or type(item["type"]) is not str or item["type"] not in TYPES):
@@ -899,16 +918,37 @@ class CompilationGuard:
                     # must not multiply retries or replay completed siblings.
                     raise
                 rejected = error
-                logger.warning("知识隐私响应拒绝：failure_code=%s reason=%s correction_attempt=%d",
-                               error.failure_code, error.reason, correction)
+                logger.warning("知识隐私响应拒绝：failure_code=%s reason=%s shape=%s correction_attempt=%d",
+                               error.failure_code, error.reason, error.shape, correction)
             except (PrivacyScanDeferred, BudgetBusy):
                 if rejected is not None:
                     # A continuation would forget the bounded correction count
                     # and repeat a paid invalid packet indefinitely.
-                    raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True) from None
+                    raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True,
+                                                 shape=rejected.shape) from None
                 raise
         assert rejected is not None
-        raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True) from None
+        if len(records) > 1 and depth < 8:
+            logger.warning("知识隐私响应拆包重扫：failure_code=%s reason=%s shape=%s records=%d depth=%d",
+                           rejected.failure_code, rejected.reason, rejected.shape, len(records), depth)
+            key = self.ledger.digest("packet:v2:" + encoded(records)) if self.ledger else ""
+            await self._split(records, scope, start, depth, key)
+            return
+        raise PrivacyResponseInvalid(rejected.reason, correction_exhausted=True,
+                                     shape=rejected.shape) from None
+
+    async def _split(self, records: list[dict], scope: str, start: int, depth: int, key: str) -> None:
+        if len(records) <= 1 or depth >= 8:
+            raise CompilationLimitError("隐私扫描单个字段的输出仍被截断，停止该单元")
+        if self.ledger:
+            self.reserve(0)
+            self.ledger.complete(key, "split")
+        middle = len(records) // 2
+        await self._scan(records[:middle], scope, start, depth + 1)
+        await self._scan(records[middle:], scope, start + middle, depth + 1)
+        if self.ledger:
+            self.reserve(0)
+            self.ledger.complete(key)
 
     async def _scan_once(self, records: list[dict], scope: str, start: int, depth: int, *,
                          correction_reason: str | None, correction_attempt: int) -> None:
@@ -1019,14 +1059,7 @@ class CompilationGuard:
             if self.ledger:
                 self.reserve(0)
                 self.ledger.complete(key, "split")
-        if len(records) <= 1 or depth >= 8:
-            raise CompilationLimitError("隐私扫描单个字段的输出仍被截断，停止该单元")
-        middle = len(records) // 2
-        await self._scan(records[:middle], scope, start, depth + 1)
-        await self._scan(records[middle:], scope, start + middle, depth + 1)
-        if self.ledger:
-            self.reserve(0)
-            self.ledger.complete(key)
+        await self._split(records, scope, start, depth, key)
 
     def _account(self, usage: TokenUsage, messages: object, output: str, bound: int, *,
                  call_id: str | None = None, response_model: str | None = None) -> None:
@@ -1215,7 +1248,8 @@ async def compile_packet(packet: dict, guard: CompilationGuard, proof: VerifiedP
                 async def send():
                     guard.check_discoveries()
                     if projected:
-                        message_filter.bind_reservation(bound, output_limit, transport_kwargs)
+                        message_filter.bind_reservation(bound, output_limit, transport_kwargs,
+                                                        summary_budget_level=summary_budget_level)
                     return await client.chat(messages, max_tokens=output_limit,
                         temperature=max(0.0, 0.1 - attempt * 0.05), retry_max=0,
                         **transport_kwargs, **semantic_kwargs)

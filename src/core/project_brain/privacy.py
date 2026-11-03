@@ -34,9 +34,11 @@ class PrivacyLedger:
     """Share irreversible discoveries and scan receipts within one build only."""
 
     def __init__(self, directory: Path, *, create: bool = True, seal_directory: Path | None = None,
-                 require_index: bool = False) -> None:
-        if type(create) is not bool or type(require_index) is not bool:
+                 require_index: bool = False, placeholder_key: bytes | None = None) -> None:
+        if (type(create) is not bool or type(require_index) is not bool
+                or placeholder_key is not None and type(placeholder_key) is not bytes):
             raise ValueError("隐私账本创建模式无效")
+        self.placeholder_key = placeholder_key
         self._require_index = require_index
         self.root = directory / "privacy"
         self.index = self.root / "fingerprints.json"
@@ -578,13 +580,25 @@ class PrivacyLedger:
             while position < len(segment):
                 if position in found:
                     length, kind, digest = found[position]
-                    parts.append(f"<<{kind}_{int(digest[:16], 16)}>>")
+                    matched_value = segment[position:position + length]
+                    number = (int(digest[:16], 16) if self.placeholder_key is None else
+                        int(hmac.new(self.placeholder_key, b"placeholder:v1:" + matched_value.encode(),
+                                     hashlib.sha256).hexdigest()[:16], 16))
+                    parts.append(f"<<{kind}_{number}>>")
                     position += length
                 else:
                     parts.append(segment[position])
                     position += 1
             result.append("".join(parts))
         return "".join(result)
+
+
+def project_placeholder_key(work_base: Path, project_id: int) -> bytes:
+    """Derive an in-memory placeholder key from the authenticated project identity."""
+    from src.core.project_brain.source_catalog import identity_key
+
+    return hmac.new(identity_key(work_base, project_id, create=False),
+                    b"project-brain/privacy-placeholder/v1", hashlib.sha256).digest()
 
 
 class LedgerPrivacyFilter(PrivacyFilter):

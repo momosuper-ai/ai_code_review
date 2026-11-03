@@ -11,6 +11,7 @@ from openai import APIStatusError
 from src.config import settings
 from src.core.http_transport import complete_response
 from src.core.project_brain.exceptions import ModelTransportFailed, ModelWorkAdmissionDenied
+from src.core.project_brain.timing import segment
 from src.core.project_brain.usage import CallSpec, HTTP_ERROR_UNIT_LIMIT
 from src.utils.logger import logger
 
@@ -24,6 +25,13 @@ class PreparedCall:
     bound: int
     send: Callable[[], Awaitable[Any]]
     context: Any = None
+
+
+class ModelCallTimedOut(ModelTransportFailed):
+    failure_code = "model_call_timeout"
+
+    def __init__(self) -> None:
+        Exception.__init__(self, self.failure_code)
 
 
 def completed_http_error(exc: Exception) -> int | None:
@@ -64,7 +72,9 @@ def _admit_work(guard, *, timeout: float, after_response: bool, privacy: bool,
         # A closed HTTP failure already happened. Its bounded recovery must
         # remain terminal, never become a fresh resumable input delivery.
         raise ModelTransportFailed("model_http_retry_window_exhausted")
-    error = ModelWorkAdmissionDenied(reason, phase, after_response=after_response)
+    error = ModelWorkAdmissionDenied(reason, phase, after_response=after_response,
+                                     remaining_seconds=max(0, int(remaining)),
+                                     required_seconds=int(timeout))
     logger.warning("知识模型工作准入拒绝：role=%s phase=%s reason=%s after_response=%s reservation_created=%s remaining_seconds=%d required_seconds=%d",
                    "privacy" if privacy else "semantic", error.phase, error.reason,
                    error.after_response, error.reservation_created, max(0, int(remaining)), int(timeout))
@@ -103,9 +113,21 @@ async def run_model_call(guard, spec: CallSpec, prepare: Callable[[], PreparedCa
         # latest filter under the already reserved conservative upper bound.
         if privacy:
             guard.calls += 1
+        from src.core.project_brain.compiler import LateProjectionExceedsReservation
         try:
-            result = await asyncio.wait_for(request.send(), timeout=timeout)
+            with segment("model_call"):
+                result = await asyncio.wait_for(request.send(), timeout=timeout)
             return result, call_id, request
+        except LateProjectionExceedsReservation:
+            if guard.call_meter is not None and call_id is not None:
+                guard.call_meter.close_unsent(call_id, request.bound)
+            raise
+        except TimeoutError:
+            close_timeout = getattr(guard.call_meter, "close_timed_out", None)
+            if (guard.call_meter is not None and call_id is not None
+                    and callable(close_timeout) and close_timeout(call_id, request.bound)):
+                raise ModelCallTimedOut() from None
+            raise
         except Exception as exc:
             status = completed_http_error(exc)
             if status is None or guard.call_meter is None or call_id is None:

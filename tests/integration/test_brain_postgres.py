@@ -54,7 +54,7 @@ def pg_project(monkeypatch: pytest.MonkeyPatch):
 def test_postgres_migration_contract(pg_project: int) -> None:
     """已执行的迁移必须与关键生命周期列和唯一约束一致。"""
     with SyncSession() as session:
-        assert session.scalar(text("SELECT version_num FROM alembic_version")) == "010_brain_control"
+        assert session.scalar(text("SELECT version_num FROM alembic_version")) == "011_brain_diagnostics"
     inspector = inspect(sync_engine)
     assert {"child_build_id", "parent_build_id", "manifest_hash", "plan"} <= {
         column["name"] for column in inspector.get_columns("brain_recoveries")}
@@ -64,6 +64,8 @@ def test_postgres_migration_contract(pg_project: int) -> None:
     assert "usage_tracking_version" in {column["name"] for column in inspector.get_columns("brain_builds")}
     assert {"execution_state", "pause_requested_at", "paused_at", "resumed_at"} <= {
         column["name"] for column in inspector.get_columns("brain_builds")}
+    assert "diagnostic" in {column["name"] for column in inspector.get_columns("brain_builds")}
+    assert "diagnostic" in {column["name"] for column in inspector.get_columns("brain_units")}
     assert "ck_brain_build_execution_state" in {
         constraint["name"] for constraint in inspector.get_check_constraints("brain_builds")}
     assert {"role", "requested_model", "response_model", "state", "reserved_tokens", "prompt_tokens", "completion_tokens",

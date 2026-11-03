@@ -38,6 +38,7 @@ def storage():
                 "005_add_project_brain.py", "006_brain_automatic_maintenance.py",
                 "007_brain_model_usage.py", "008_brain_http_transport.py",
                 "010_brain_execution_control.py",
+                "011_brain_diagnostics.py",
             ):
                 migration(filename).upgrade()
     with Session(engine) as session:
